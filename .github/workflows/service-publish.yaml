@@ -274,7 +274,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -436,7 +436,7 @@ jobs:
           persist-credentials: false
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -507,14 +507,14 @@ jobs:
           fi
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -774,7 +774,7 @@ jobs:
       contents: read
     steps:
       - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -839,7 +839,7 @@ jobs:
     # the nested workflow: gitops-promote.yaml is shared with the helm repository and unchanged (works with the GitHub App token, not this one).
     # `Promote to stage` and `Promote to prod` call the same pinned file. It serialises itself per app and environment (its own concurrency group).
     permissions: {}
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/gitops-promote.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/gitops-promote.yaml@ee7562da9860ad2c824ce50e6d56c1f62f1d3515 # v3.3.0
     with:
       app: ${{ inputs.app }}
       env: ${{ inputs.env }}
@@ -1567,7 +1567,7 @@ jobs:
     if: ${{ needs.approve-stage.outputs.go == 'true' }}
     # the same shared workflow as `Open dev PR` (unchanged); the digest is THIS run's, never "the newest"
     permissions: {}
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/gitops-promote.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/gitops-promote.yaml@ee7562da9860ad2c824ce50e6d56c1f62f1d3515 # v3.3.0
     with:
       app: ${{ inputs.app }}
       env: stage
@@ -2289,7 +2289,7 @@ jobs:
     if: ${{ needs.approve-prod.outputs.go == 'true' }}
     # the same shared workflow as `Open dev PR` (unchanged); the digest is THIS run's, never "the newest"
     permissions: {}
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/gitops-promote.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/gitops-promote.yaml@ee7562da9860ad2c824ce50e6d56c1f62f1d3515 # v3.3.0
     with:
       app: ${{ inputs.app }}
       env: prod
