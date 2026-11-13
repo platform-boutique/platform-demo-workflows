@@ -405,6 +405,8 @@ Example, the publish job:
 
 To take a major upgrade deliberately: raise it by hand (or temporarily remove the ignore), test, merge.
 
+`commit-message` is written on the multi-ecosystem **group**, not on each update: GitHub treats it (with `milestone`, `target-branch`, `pull-request-branch-name`) as a group-only option and rejects the whole file otherwise. Details and what is validated offline: [docs/dependabot.md](docs/dependabot.md).
+
 ## Changing a workflow (the procedure that worked)
 
 1. Branch, edit (`tools/gen-lang-workflows.py` generates the node/python/java/dotnet files, `tools/gen-service-ci.py` the `service-ci-*` files from them, `tools/gen-service-publish.py` `service-publish.yaml` - edit the source or the generator, run them in that order),
