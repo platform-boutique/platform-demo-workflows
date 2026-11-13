@@ -4,7 +4,7 @@ and a nested job may not ask for more than the job that calls it. A violation sh
 This check walks the service-ci-<language>.yaml files (flat: no nested workflow, so only their own jobs count) and
 service-publish.yaml (flat too; its only nested workflow is gitops-promote.yaml) of the working tree (every
 `uses: .../workflows/<name>.yaml@<sha>` of this repository is resolved to the local file) starting from the permissions that
-tools/gen-callers.py grants in the generated callers, for all 11 app repositories.
+tools/gen-callers.py grants in the generated callers, for all 16 repositories of gen-callers.py.
 The grant of the `ci` and `publish` jobs must also be EXACTLY what the called file's jobs need (least privilege): ci = contents read +
 packages write (the image job pushes the tree image), plus checks: write for dotnet and nobody else; publish = contents read +
 packages write + id-token write + actions read (the approval jobs of the dev -> stage -> prod chain read who approved the environment).
@@ -66,7 +66,10 @@ def needed(wf):
 
 MERGE_PERMS = {"contents": "write", "pull-requests": "write", "actions": "write"}
 SERVICES = ("checkout-service", "shipping-service", "frontend", "product-catalog-service", "currency-service", "payment-service",
-            "email-service", "recommendation-service", "ad-service", "cart-service", "product-catalog-db")
+            "email-service", "recommendation-service", "ad-service", "cart-service", "product-catalog-db", "review-service", "order-service",
+            "user-service", "inventory-service", "load-generator")
+# no publish.yaml: no image pipeline (product-catalog-db) or no helm chart yet (publish=False in gen-callers.py)
+NO_PUBLISH = {"product-catalog-db", "review-service", "order-service", "user-service", "inventory-service", "load-generator"}
 problems = []
 with tempfile.TemporaryDirectory() as tmp:
     for svc in SERVICES:
@@ -74,7 +77,7 @@ with tempfile.TemporaryDirectory() as tmp:
         for name in ("ci.yaml", "publish.yaml"):
             f = pathlib.Path(tmp) / ".github/workflows" / name
             if not f.exists():
-                continue  # product-catalog-db has no publish.yaml
+                continue  # product-catalog-db and the services without a chart yet (publish=False) have no publish.yaml
             caller = load(f)
             first = "ci" if name == "ci.yaml" else "publish"
             job = caller["jobs"].get(first)
@@ -113,8 +116,10 @@ with tempfile.TemporaryDirectory() as tmp:
                     if part not in cond:
                         problems.append(f"{svc}:{name} merge: `if` lacks {part!r}")
                 start = (m.get("with") or {}).get("start-publish", True)
-                if start != (svc != "product-catalog-db"):
-                    problems.append(f"{svc}:{name} merge {'starts' if start else 'does not start'} Publish, but this repository {'has' if svc != 'product-catalog-db' else 'has no'} publish.yaml")
+                if start != (svc not in NO_PUBLISH):
+                    problems.append(f"{svc}:{name} merge {'starts' if start else 'does not start'} Publish, but this repository {'has' if svc not in NO_PUBLISH else 'has no'} publish.yaml")
+                if (pathlib.Path(tmp) / ".github/workflows/publish.yaml").exists() == (svc in NO_PUBLISH):
+                    problems.append(f"{svc}: publish.yaml {'exists' if svc in NO_PUBLISH else 'is missing'}, expected the opposite")
             else:
                 dispatch = ((caller["on"].get("workflow_dispatch") or {}).get("inputs") or {})
                 if "before" not in dispatch or job["with"].get("before") != "${{ inputs.before }}":

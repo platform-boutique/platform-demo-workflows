@@ -3,7 +3,11 @@
 then the `merge` job: the owner approves the `merge` environment on the run page and the pull request is squash-merged) and
 publish.yaml (push to main, or a manual/merge-button run with `before` -> service-publish.yaml). Removes the old ci-*.yaml / release.yaml.
 usage: gen-callers.py <repo-dir> <service> <wf-sha> <wf-ver>
-<service> is the app name = repository name without the `app-` prefix = helm chart name = Docker Hub repository."""
+<service> is the app name = repository name without the `app-` prefix = helm chart name = Docker Hub repository.
+
+Per service, CFG may carry `publish` (default: True, except for lang "none"). publish=False writes ONLY ci.yaml (the pull-request gate and
+the merge button, whose `start-publish` is then false) and no publish.yaml: Publish opens a dev pull request in platform-demo-helm, which
+needs a chart and a line in envs/*/workloads.yaml first (APPLICATION-STANDARDS CI-03). Flip the flag when the chart exists."""
 import os, sys
 
 repo_dir, svc, sha, ver = sys.argv[1:5]
@@ -24,7 +28,27 @@ CFG = {
   "ad-service": dict(lang="java", with_={}, trivy=""),
   "product-catalog-db": dict(lang="none", with_={}, trivy=""),
   "cart-service": dict(lang="dotnet", with_={"solution": "cartservice.sln", "project": "src/cartservice.csproj", "test-project": "tests/cartservice.tests.csproj"}, trivy=""),
-}[svc]
+  # The five services below have NO helm chart yet (deferred): they get the pull-request caller only. When the chart and the lines in
+  # platform-demo-helm envs/{dev,stage,prod}/workloads.yaml exist, delete `publish=False` and regenerate: publish.yaml appears and the
+  # merge button starts it. They are Go gRPC + Postgres (build-path default ./cmd/server/...; the integration tests carry the build tag
+  # `integration`, so the default test-packages ./... does not run them and needs no database) or Python/Locust. No smoke test: the
+  # server needs Postgres at start-up.
+  "review-service": dict(lang="go", with_={}, trivy="", publish=False),
+  "order-service": dict(lang="go", with_={}, trivy="", publish=False),
+  "user-service": dict(lang="go", with_={}, trivy="", publish=False),
+  "inventory-service": dict(lang="go", with_={}, trivy="", publish=False),
+  # no inbound API; the entry point is src/loadgen/__main__.py, not the default src/server.py
+  "load-generator": dict(lang="python", with_={"build-check-file": "src/loadgen/__main__.py"}, trivy="", publish=False),
+}
+if svc not in CFG:
+    sys.exit(f"gen-callers: unknown service {svc!r}; add it to CFG (known: {', '.join(sorted(CFG))})")
+CFG = CFG[svc]
+# Publish needs an image: a repository without an image pipeline (lang none) cannot publish. Both settings must agree.
+PUBLISH = CFG.get("publish", CFG["lang"] != "none")
+if not isinstance(PUBLISH, bool):
+    sys.exit(f"gen-callers: {svc}: publish must be True or False, got {PUBLISH!r}")
+if PUBLISH and CFG["lang"] == "none":
+    sys.exit(f"gen-callers: {svc}: publish=True contradicts lang=\"none\" (no image pipeline, nothing to publish); drop publish or set a language")
 
 
 # inputs of service-ci-<language> (see its `on.workflow_call.inputs`); the keys in CFG["with_"] are passed through unchanged
@@ -54,8 +78,13 @@ if CFG["lang"] == "dotnet":
     ci_perms += "      checks: write # the test reporter publishes a check run\n"
 
 # The merge button is service-merge.yaml (defined once, like the rest). The caller keeps the `if:` (only same-repository pull requests that
-# are not Dependabot's: those have a read-only token) and grants what the called job needs; product-catalog-db has no Publish to start.
-MERGE_WITH = "" if CFG["lang"] != "none" else "    with:\n      start-publish: false # no image pipeline, hence no Publish\n"
+# are not Dependabot's: those have a read-only token) and grants what the called job needs; a repository without a Publish caller has
+# none to start.
+MERGE_WITH = ""
+if CFG["lang"] == "none":
+    MERGE_WITH = "    with:\n      start-publish: false # no image pipeline, hence no Publish\n"
+elif not PUBLISH:
+    MERGE_WITH = "    with:\n      start-publish: false # no publish.yaml yet (no helm chart): set publish=True in tools/gen-callers.py when it exists\n"
 
 CI = f"""name: CI
 
@@ -141,8 +170,8 @@ for old in ("ci-feature.yaml", "ci-main.yaml", "release.yaml"):
     p = os.path.join(d, old)
     if os.path.exists(p): os.remove(p)
 open(os.path.join(d, "ci.yaml"), "w").write(CI)
-if CFG["lang"] != "none":  # product-catalog-db has no image pipeline: nothing to publish
+if PUBLISH:  # no image pipeline (product-catalog-db) or no helm chart yet (publish=False): no Publish caller
     open(os.path.join(d, "publish.yaml"), "w").write(PUB)
 elif os.path.exists(os.path.join(d, "publish.yaml")):
     os.remove(os.path.join(d, "publish.yaml"))
-print("wrote callers for", svc)
+print("wrote callers for", svc, "(ci.yaml + publish.yaml)" if PUBLISH else "(ci.yaml only: publish is off)")
