@@ -253,6 +253,29 @@ for name, env_, rc_want, want in (
     check(f"record: {name}: the record step writes outputs only (the summary is the last step)", parse_summary(e) == "")
     e.done()
 
+# ───────────────────────── Name this build (build-args SERVICE_VERSION / SERVICE_COMMIT / BUILD_TIME) ─────────────────────────
+BI = step(ci_files["go"]["jobs"]["image"], "id", "buildinfo")["run"]
+check("buildinfo: the pull-request and the publish workflow run the same script", all(step(wf["jobs"]["image"], "id", "buildinfo")["run"] == BI for wf in list(ci_files.values()) + [pub]))
+H, M = "1" * 40, "2" * 40
+for name, env_, rc_want, want in (
+        ("pull request: 0.0.0-pr.<number>, the head commit (not the merge commit)",
+         {"EVENT": "pull_request", "PR_NUMBER": "42", "PR_HEAD_SHA": H, "GITHUB_SHA": M}, 0,
+         {"version": "0.0.0-pr.42", "commit": H}),
+        ("push to main: 0.0.0-sha.<7 characters of the commit>", {"EVENT": "push", "PR_NUMBER": "", "PR_HEAD_SHA": "", "GITHUB_SHA": M}, 0,
+         {"version": "0.0.0-sha." + "2" * 7, "commit": M}),
+        ("manual run: like a push", {"EVENT": "workflow_dispatch", "PR_NUMBER": "", "PR_HEAD_SHA": "", "GITHUB_SHA": M}, 0,
+         {"version": "0.0.0-sha." + "2" * 7, "commit": M}),
+        ("a pull request number that is not a number", {"EVENT": "pull_request", "PR_NUMBER": "4;2", "PR_HEAD_SHA": H, "GITHUB_SHA": M}, 1, {}),
+        ("a pull request without a head commit", {"EVENT": "pull_request", "PR_NUMBER": "4", "PR_HEAD_SHA": "", "GITHUB_SHA": M}, 1, {}),
+        ("a commit that is not 40 hex characters", {"EVENT": "push", "PR_NUMBER": "", "PR_HEAD_SHA": "", "GITHUB_SHA": "abc"}, 1, {})):
+    e = Env()
+    rc, out = e.run(BI, env_)
+    o = e.outputs()
+    bt = o.get("build-time", "")
+    check(f"buildinfo: {name}", (rc == 0) == (rc_want == 0) and all(o.get(k) == v for k, v in want.items())
+          and (rc_want != 0 or re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", bt) is not None), f"rc={rc} {o} {out}")
+    e.done()
+
 # ───────────────────────── Copy to Docker Hub ─────────────────────────
 COPY = step(pub["jobs"]["publish"], "id", "promote")["run"]
 SRC_BYTES = b'{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"digest":"sha256:' + b"c" * 64 + b'"}]}'

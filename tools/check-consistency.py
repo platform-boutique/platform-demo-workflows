@@ -420,7 +420,7 @@ if len(copy_runs) != 1 or copy_runs[0].count("--tag") != 1 or 'tag="sha-${GITHUB
     problems.append("service-publish.yaml: the Docker Hub copy must make exactly one tag, sha-<first 7 chars of the commit>")
 # steps shared with the pull-request image job are the same text
 for lang, image in flat_images.items():
-    for sid in ("find", "image", "mode", "cache"):
+    for sid in ("find", "buildinfo", "image", "mode", "cache"):
         a, b = step_by_id(image, sid), step_by_id(pj["image"], sid)
         if sid == "mode":
             continue  # only the pull-request workflows decide whether a run may push
@@ -435,6 +435,15 @@ for lang, image in flat_images.items():
     a, b = step_by_id(image, "build"), step_by_id(pj["image"], "build")
     if a is None or b is None or a["with"]["labels"] != b["with"]["labels"] or a["uses"] != b["uses"]:
         problems.append(f"service-ci-{lang}.yaml: build step labels or pin differ from service-publish.yaml")
+    # the build identity (CODE-06 / IMG-05): the same three build-args in both pipelines, taken from the `buildinfo` step that runs before the build
+    want_args = ("SERVICE_VERSION=${{ steps.buildinfo.outputs.version }}\nSERVICE_COMMIT=${{ steps.buildinfo.outputs.commit }}\n"
+                 "BUILD_TIME=${{ steps.buildinfo.outputs.build-time }}\n")
+    ids_ = [s_.get("id") for s_ in image["steps"]]
+    for where_, step_ in ((f"service-ci-{lang}.yaml", a), ("service-publish.yaml", b)):
+        if step_ is None or step_["with"].get("build-args") != want_args:
+            problems.append(f"{where_}: the image build must pass build-args SERVICE_VERSION, SERVICE_COMMIT and BUILD_TIME from the buildinfo step")
+    if "buildinfo" not in ids_ or ids_.index("buildinfo") > ids_.index("build"):
+        problems.append(f"service-ci-{lang}.yaml: the buildinfo step must come before the build")
     ta = [s_ for s_ in image["steps"] if str(s_.get("uses", "")).startswith("aquasecurity/trivy-action")]
     tb = [s_ for s_ in pj["scan"]["steps"] if str(s_.get("uses", "")).startswith("aquasecurity/trivy-action")]
     if len(ta) != 1 or len(tb) != 1 or {k: v for k, v in ta[0]["with"].items() if k != "image-ref"} != {k: v for k, v in tb[0]["with"].items() if k != "image-ref"}:

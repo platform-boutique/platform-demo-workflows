@@ -191,6 +191,38 @@ else
 fi
 """
 
+# What the image says about itself. The Dockerfiles of the app repositories declare `ARG SERVICE_VERSION` and `ARG SERVICE_COMMIT` (labels,
+# the process environment, internal/obs); `ARG BUILD_TIME` is optional (BuildKit ignores a build-arg a Dockerfile does not declare).
+# The stage/prod version v1.0.x is only computed AFTER the build (Release stage version), so the build cannot know it: the version it
+# bakes in is derived from the commit (publish) or the pull request (pull-request build). An image that a pull request built and
+# that Publish reuses (same source tree) keeps the identity of the run that built it.
+BUILDINFO_SCRIPT = r"""
+set -euo pipefail
+if [ "$EVENT" = pull_request ]; then
+  # the pull request's own head commit, not the merge commit that is checked out (the same value as the revision label)
+  commit=$PR_HEAD_SHA
+  if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+    echo "::error::unexpected pull request number '$PR_NUMBER'"
+    exit 1
+  fi
+  version="0.0.0-pr.$PR_NUMBER"
+else
+  commit=$GITHUB_SHA
+  version="0.0.0-sha.${commit:0:7}"
+fi
+if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "::error::unexpected commit '$commit'"
+  exit 1
+fi
+build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+{
+  echo "version=$version"
+  echo "commit=$commit"
+  echo "build-time=$build_time"
+} >> "$GITHUB_OUTPUT"
+echo "build-args: SERVICE_VERSION=$version SERVICE_COMMIT=$commit BUILD_TIME=$build_time"
+"""
+
 RECORD_SCRIPT = r"""
 set -euo pipefail
 if [ "$FOUND" = true ]; then
@@ -292,6 +324,16 @@ def find_step(can_push):
             "        run: |\n" + script(FIND_SCRIPT))
 
 
+def buildinfo_step():
+    return ("      - name: Name this build (version, commit, time)\n"
+            "        id: buildinfo\n"
+            "        env:\n"
+            "          EVENT: ${{ github.event_name }}\n"
+            "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+            "          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}\n"
+            "        run: |\n" + script(BUILDINFO_SCRIPT))
+
+
 def build_step(*, push, cache_write):
     """The build. push = 'expr' (decided by the `mode` step) or 'true'. A run that cannot push loads the image into the local daemon instead.
     cache_write = True (the publish) or 'when-pushing' (pull requests: only the runs that push write the registry cache)."""
@@ -317,10 +359,17 @@ def build_step(*, push, cache_write):
             "        with:\n"
             "          context: ${{ inputs.context }}\n"
             "          file: ${{ inputs.context }}/${{ inputs.dockerfile }}\n" + pushing +
+            "          # what the Dockerfile may use (ARG SERVICE_VERSION / SERVICE_COMMIT / BUILD_TIME; an undeclared one is ignored)\n"
+            "          build-args: |\n"
+            "            SERVICE_VERSION=${{ steps.buildinfo.outputs.version }}\n"
+            "            SERVICE_COMMIT=${{ steps.buildinfo.outputs.commit }}\n"
+            "            BUILD_TIME=${{ steps.buildinfo.outputs.build-time }}\n"
             "          # where it was built (the signature of the published image names the commit that was shipped)\n"
             "          labels: |\n"
             "            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}\n"
-            "            org.opencontainers.image.revision=${{ github.event.pull_request.head.sha || github.sha }}\n"
+            "            org.opencontainers.image.revision=${{ steps.buildinfo.outputs.commit }}\n"
+            "            org.opencontainers.image.version=${{ steps.buildinfo.outputs.version }}\n"
+            "            org.opencontainers.image.created=${{ steps.buildinfo.outputs.build-time }}\n"
             "            io.platform-demo.tree=${{ steps.find.outputs.tree }}\n"
             "            io.platform-demo.build-run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\n" + cache.rstrip("\n"))
 

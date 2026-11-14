@@ -510,6 +510,38 @@ jobs:
             echo "tree $tree: $note"
           fi
 
+      - name: Name this build (version, commit, time)
+        id: buildinfo
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            # the pull request's own head commit, not the merge commit that is checked out (the same value as the revision label)
+            commit=$PR_HEAD_SHA
+            if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+              echo "::error::unexpected pull request number '$PR_NUMBER'"
+              exit 1
+            fi
+            version="0.0.0-pr.$PR_NUMBER"
+          else
+            commit=$GITHUB_SHA
+            version="0.0.0-sha.${commit:0:7}"
+          fi
+          if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::unexpected commit '$commit'"
+            exit 1
+          fi
+          build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          {
+            echo "version=$version"
+            echo "commit=$commit"
+            echo "build-time=$build_time"
+          } >> "$GITHUB_OUTPUT"
+          echo "build-args: SERVICE_VERSION=$version SERVICE_COMMIT=$commit BUILD_TIME=$build_time"
+
       - name: Build the image
         id: build
         if: steps.find.outputs.found != 'true'
@@ -520,10 +552,17 @@ jobs:
           push: ${{ steps.mode.outputs.push == 'true' }}
           load: ${{ steps.mode.outputs.push != 'true' }}
           tags: ${{ steps.mode.outputs.push == 'true' && steps.find.outputs.tag-ref || 'service-ci-scan:local' }}
+          # what the Dockerfile may use (ARG SERVICE_VERSION / SERVICE_COMMIT / BUILD_TIME; an undeclared one is ignored)
+          build-args: |
+            SERVICE_VERSION=${{ steps.buildinfo.outputs.version }}
+            SERVICE_COMMIT=${{ steps.buildinfo.outputs.commit }}
+            BUILD_TIME=${{ steps.buildinfo.outputs.build-time }}
           # where it was built (the signature of the published image names the commit that was shipped)
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.event.pull_request.head.sha || github.sha }}
+            org.opencontainers.image.revision=${{ steps.buildinfo.outputs.commit }}
+            org.opencontainers.image.version=${{ steps.buildinfo.outputs.version }}
+            org.opencontainers.image.created=${{ steps.buildinfo.outputs.build-time }}
             io.platform-demo.tree=${{ steps.find.outputs.tree }}
             io.platform-demo.build-run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # a run that pushes the image (same repository, not Dependabot) also refreshes the cache; a fork's or Dependabot's run only reads it

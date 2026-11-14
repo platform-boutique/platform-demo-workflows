@@ -96,6 +96,7 @@ def image_job():
         wfgen.login_step("Log in to ghcr.io"),
         wfgen.cache_step(),
         wfgen.find_step("true"),
+        wfgen.buildinfo_step(),
         wfgen.build_step(push="true", cache_write=True),
         wfgen.record_step("true"),
         wfgen.summary_step(scan=False),
