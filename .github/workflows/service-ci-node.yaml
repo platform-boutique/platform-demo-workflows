@@ -5,7 +5,7 @@ name: Service CI (Node)
 # The pull-request pipeline of a Node app repository, flat: every job is in this file and nothing is called from here, so the Actions graph shows
 # exactly what runs, left to right, with plain names (`ci / Build`):
 #
-#   Detect changes | Secret scan | Workflow lint   (no needs: start at t=0)
+#   Detect changes | Secret scan | Workflow lint | Docs check   (no needs: start at t=0)
 #   Lint | Build | Tests | Dependency scan | Code scan | Image build and scan
 #            (need only `Detect changes`; a docs-only change skips them, the guards still run)
 #   gate     (needs every job, always runs, names the job that failed first)
@@ -254,6 +254,152 @@ jobs:
           echo "${SHA256}  actionlint.tgz" | sha256sum -c -
           tar xzf actionlint.tgz actionlint
           ./actionlint -color
+
+  docs:
+    name: "Docs check"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      present: ${{ steps.site.outputs.present }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Look for mkdocs.yml
+        id: site
+        run: |
+          set -euo pipefail
+          if [ -f mkdocs.yml ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "no mkdocs.yml in this repository: nothing to check"
+          fi
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: steps.site.outputs.present == 'true'
+        with:
+          python-version: "3.13"
+
+      - name: Install mkdocs
+        if: steps.site.outputs.present == 'true'
+        run: pip install --quiet --disable-pip-version-check mkdocs==1.6.1 mkdocs-techdocs-core==1.7.1
+
+      - name: Build the docs (mkdocs build --strict)
+        id: build
+        if: steps.site.outputs.present == 'true'
+        run: mkdocs build --strict --site-dir "$RUNNER_TEMP/site"
+
+      - name: Check relative markdown links
+        id: links
+        if: ${{ !cancelled() && steps.site.outputs.present == 'true' }}
+        run: |
+          python3 -I - . <<'PY'
+          #!/usr/bin/env python3
+          """Markdown link check of an app repository (DOC-12): every relative link of README.md and of the pages under docs/ must point to
+          a file or directory that exists. Python 3 standard library only.
+
+          usage: check-md-links.py [repo-dir]       (default: the current directory)    exit 1 and one line per broken link
+
+            * checked: inline links and images `[text](path)`, reference definitions `[id]: path`; the path is resolved against the directory
+              of the page that holds the link (a path that starts with `/` against the repository root, as GitHub does);
+            * not checked: http(s)/mailto/... links (they need the network and fail for reasons that are not the repository's), `#anchors`
+              (the heading slugs of GitHub and of mkdocs differ), links with a `{{ template }}`;
+            * code is not text: fenced code blocks and inline code spans are skipped;
+            * the pages are README.md and every `*.md` under `docs_dir` of mkdocs.yml (default `docs`).
+
+          This file is the single source: tools/gen-service-ci.py puts it into the `Docs check` job of service-ci-<language>.yaml as written
+          here, and tools/test-md-links.py tests it.
+          """
+          import os, re, sys
+          from urllib.parse import unquote
+
+          root = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else ".")
+
+          docs_dir = "docs"
+          if os.path.isfile(os.path.join(root, "mkdocs.yml")):
+              with open(os.path.join(root, "mkdocs.yml"), encoding="utf-8") as f:
+                  m = re.search(r"^docs_dir:\s*['\"]?([^'\"\s#]+)", f.read(), re.M)
+              if m:
+                  docs_dir = m.group(1).rstrip("/")
+
+          pages = []
+          if os.path.isfile(os.path.join(root, "README.md")):
+              pages.append("README.md")
+          for base, dirs, files in os.walk(os.path.join(root, docs_dir)):
+              dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+              pages += [os.path.relpath(os.path.join(base, n), root) for n in sorted(files) if n.endswith(".md")]
+
+          INLINE = re.compile(r"!?\[[^\]]*\]\(\s*(<[^>]*>|[^)\s]*)(?:\s+(?:\"[^\"]*\"|'[^']*'))?\s*\)")
+          REFDEF = re.compile(r"^ {0,3}\[[^\]]+\]:\s*(<[^>]*>|\S+)")
+          SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+          FENCE = re.compile(r"^ {0,3}(```|~~~)")
+
+          broken, checked = [], 0
+          for page in pages:
+              with open(os.path.join(root, page), encoding="utf-8", errors="replace") as f:
+                  lines = f.read().split("\n")
+              fence = None
+              for n, line in enumerate(lines, 1):
+                  m = FENCE.match(line)
+                  if m:
+                      if fence is None:
+                          fence = m.group(1)
+                      elif m.group(1) == fence:
+                          fence = None
+                      continue
+                  if fence is not None:
+                      continue
+                  text = re.sub(r"`[^`]*`", "", line)
+                  targets = [t for t in INLINE.findall(text)]
+                  r = REFDEF.match(text)
+                  if r:
+                      targets.append(r.group(1))
+                  for t in targets:
+                      t = t.strip("<>")
+                      if not t or t.startswith("#") or SCHEME.match(t) or t.startswith("//") or "{{" in t:
+                          continue
+                      path = unquote(re.split(r"[#?]", t, 1)[0])
+                      if not path:
+                          continue
+                      full = os.path.join(root, path.lstrip("/")) if path.startswith("/") else os.path.join(root, os.path.dirname(page), path)
+                      checked += 1
+                      if not os.path.exists(os.path.normpath(full)):
+                          broken.append((page, n, t))
+
+          for page, n, t in broken:
+              print(f"::error file={page},line={n}::broken link: {t}")
+              print(f"{page}:{n}: broken link -> {t}")
+          print(f"markdown links: {checked} relative links in {len(pages)} pages, {len(broken)} broken")
+          sys.exit(1 if broken else 0)
+          PY
+
+      - name: Write the docs summary
+        if: ${{ !cancelled() }}
+        env:
+          PRESENT: ${{ steps.site.outputs.present }}
+          BUILD: ${{ steps.build.outcome }}
+          LINKS: ${{ steps.links.outcome }}
+        run: |
+          set -euo pipefail
+          words() { case "$1" in success) echo passed ;; failure) echo "**failed**" ;; skipped) echo "not run" ;; *) echo "not run" ;; esac; }
+          {
+            echo "### Docs check"
+            echo
+            if [ "$PRESENT" != true ]; then
+              echo "This repository has no \`mkdocs.yml\`, so there is nothing to check."
+            else
+              echo "| | |"
+              echo "|---|---|"
+              echo "| \`mkdocs build --strict\` | $(words "$BUILD") |"
+              echo "| relative links in README.md and docs/ | $(words "$LINKS") |"
+              echo
+              echo "External links and \`#anchors\` are not checked. The details are in the log of each step."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   lint:
     name: "Lint"
@@ -675,7 +821,7 @@ jobs:
 
   gate:
     name: "gate"
-    needs: [changes, secret-scan, workflow-lint, lint, build, test, sca, sast, image]
+    needs: [changes, secret-scan, workflow-lint, docs, lint, build, test, sca, sast, image]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -686,14 +832,15 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
           IMAGE: ${{ inputs.image }}
           CODE: ${{ needs.changes.outputs.code }}
+          DOCS: ${{ needs.docs.outputs.present }}
           EVENT: ${{ github.event_name }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           ACTOR: ${{ github.actor }}
         run: |
           # Jobs this workflow has, in the order of the graph: the three guards, then the checks (generated per language), and their names.
-          guards=" changes secret-scan workflow-lint "
+          guards=" changes secret-scan workflow-lint docs "
           checks=" lint build test sca sast image "
-          declare -A names=([changes]="Detect changes" [secret-scan]="Secret scan" [workflow-lint]="Workflow lint" [lint]="Lint" [build]="Build" [test]="Tests" [sca]="Dependency scan" [sast]="Code scan" [image]="Image build and scan")
+          declare -A names=([changes]="Detect changes" [secret-scan]="Secret scan" [workflow-lint]="Workflow lint" [docs]="Docs check" [lint]="Lint" [build]="Build" [test]="Tests" [sca]="Dependency scan" [sast]="Code scan" [image]="Image build and scan")
 
           # Text that does not come from this script (an unknown job id, a result) is shown with letters, digits and . _ - only.
           safe() { printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9._-' '?' | cut -c1-60; }
@@ -774,6 +921,7 @@ jobs:
               if [ "$res" = skipped ]; then
                 if [ "$CODE" = "false" ]; then cell="skipped: documentation only"; else cell="skipped: no image pipeline"; fi
               fi
+              if [ "$job" = docs ] && [ "$res" = success ] && [ "$DOCS" = false ]; then cell="passed: no mkdocs.yml, nothing to check"; fi
             elif [ "$failed" = 1 ]; then
               cell=$(words "$res")
             else

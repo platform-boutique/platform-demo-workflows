@@ -9,8 +9,8 @@ import yaml
 
 root = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), ".."))
 wfdir = os.path.join(root, ".github", "workflows")
-GUARDS = ["changes", "secret-scan", "workflow-lint"]
-NAME = {"changes": "Detect changes", "secret-scan": "Secret scan", "workflow-lint": "Workflow lint", "lint": "Lint", "build": "Build",
+GUARDS = ["changes", "secret-scan", "workflow-lint", "docs"]
+NAME = {"changes": "Detect changes", "secret-scan": "Secret scan", "workflow-lint": "Workflow lint", "docs": "Docs check", "lint": "Lint", "build": "Build",
         "test": "Tests", "sca": "Dependency scan", "sast": "Code scan", "image": "Image build and scan"}
 failures, count = [], 0
 
@@ -30,7 +30,7 @@ def run(script, needs, image, code, event=PR):
         summary = os.path.join(tmp, "summary.md")
         open(summary, "w").close()
         env = {"PATH": os.environ["PATH"], "NEEDS": json.dumps(needs), "IMAGE": image, "CODE": code, "GITHUB_STEP_SUMMARY": summary,
-               "EVENT": event["event"], "HEAD_REPO": event["head"], "ACTOR": event["actor"], "GITHUB_REPOSITORY": "o/r"}
+               "DOCS": str((needs.get("docs") or {}).get("outputs", {}).get("present", "")), "EVENT": event["event"], "HEAD_REPO": event["head"], "ACTOR": event["actor"], "GITHUB_REPOSITORY": "o/r"}
         p = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], env=env, capture_output=True, text=True)
         return p.returncode, p.stdout, open(summary).read()
 
@@ -44,7 +44,7 @@ for lang in ("go", "node", "python", "java", "dotnet", "none"):
         n = {}
         for j in all_jobs:
             if j in GUARDS:
-                n[j] = {"result": "success", "outputs": {"code": code} if j == "changes" else {}}
+                n[j] = {"result": "success", "outputs": {"code": code} if j == "changes" else {"present": "true"} if j == "docs" else {}}
             elif code == "true" and (j != "image" or img):
                 n[j] = {"result": "success", "outputs": {}}
             else:
@@ -101,6 +101,12 @@ for lang in ("go", "node", "python", "java", "dotnet", "none"):
     check("a job nobody told the gate about", False, {**needs(), "lint-extra": {"result": "success", "outputs": {}}}, contains=["(unknown job)"])
     check("failed and a different job unexplained-skipped: only the failure is the cause", False,
           needs(**{victim: "failure", "workflow_lint": "skipped"}), contains=[f"{victim} failure"], absent=["workflow-lint is 'skipped'"])
+    n = needs()
+    n["docs"]["outputs"]["present"] = "false"
+    check("docs check without mkdocs.yml says so", True, n, summary_has=["| Docs check | passed: no mkdocs.yml, nothing to check |"])
+    check("docs check failed", False, needs(docs="failure"), contains=["docs failure"], starts=None)
+    check("docs check skipped is unexplained", False, needs(docs="skipped"), contains=["docs is 'skipped', expected 'success'"])
+    check("docs check runs for a documentation-only change", True, needs(code="false"), code="false", summary_has=["| Docs check | passed |"])
     n = needs()
     check("step summary has the table", True, n, summary_has=["| Job | Result |", "| Detect changes | passed |", "| Secret scan | passed |"])
 

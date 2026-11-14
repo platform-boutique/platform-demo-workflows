@@ -121,11 +121,11 @@ def script(text, indent=10):
 
 def pin(action):
     """`<action>@<sha> # <version>` as docker-build.yaml / docker-promote.yaml / changed-paths.yaml / gitops-promote.yaml use it today."""
-    for fname in ("docker-build.yaml", "docker-promote.yaml", "changed-paths.yaml", "gitops-promote.yaml"):
+    for fname in ("docker-build.yaml", "docker-promote.yaml", "changed-paths.yaml", "gitops-promote.yaml", "python-ci.yaml"):
         m = re.search(r"uses: (" + re.escape(action) + r"@[0-9a-f]{40} # \S+)", read_text(fname))
         if m:
             return m.group(1)
-    raise AssertionError(f"no pin for {action} in docker-build/docker-promote/changed-paths/gitops-promote")
+    raise AssertionError(f"no pin for {action} in docker-build/docker-promote/changed-paths/gitops-promote/python-ci")
 
 
 # ───────────────────────── the image steps both pipelines share ─────────────────────────
