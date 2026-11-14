@@ -202,7 +202,17 @@ node += job("lint-format", "Lint & Format", steps(co(), NODE_SETUP, """
 """))
 node += secret_scan()
 node += job("build-check", "Build Check", steps(co(), NODE_SETUP, "- name: Build\n  run: npm run build"))
-node += job("unit-tests", "Unit Tests", steps(co(), NODE_SETUP, "- name: Run unit tests\n  run: npm run test:ci"))
+node += job("unit-tests", "Unit Tests", steps(co(), NODE_SETUP, """
+- name: Run unit tests
+  run: |
+    # TEST-06: when the repository's test:ci script runs jest, jest also prints the coverage (nothing to install, no threshold);
+    # any other runner is left as it is
+    if npm pkg get "scripts.test:ci" | grep -q jest; then
+      npm run test:ci -- --coverage --coverageReporters=text-summary --coverageReporters=text
+    else
+      npm run test:ci
+    fi
+"""))
 node += "\n  # ─── security scans (all jobs run in parallel) ────────────────────────────\n"
 node += job("sca", "SCA - Dependency Vulnerabilities", steps(co(), NODE_SETUP, """
 - name: Run npm audit
@@ -311,7 +321,14 @@ py += job("unit-tests", "Unit Tests", steps(co(), PY_SETUP, """
 - name: Run unit tests
   env:
     TESTS_PATH: ${{ inputs.tests-path }}
-  run: pytest "$TESTS_PATH" -v --tb=short
+    SOURCE_DIR: ${{ inputs.source-dir }}
+  run: |
+    # TEST-06: coverage is printed when pytest-cov is already a dev dependency of the repository (nothing is added, no threshold)
+    if python -c "import pytest_cov" 2>/dev/null; then
+      pytest "$TESTS_PATH" -v --tb=short --cov="$SOURCE_DIR" --cov-report=term
+    else
+      pytest "$TESTS_PATH" -v --tb=short
+    fi
 """))
 py += "\n  # ─── security scans (all jobs run in parallel) ────────────────────────────\n"
 py += job("sca", "SCA - Dependency Vulnerabilities", steps(co(), PY_SETUP, """

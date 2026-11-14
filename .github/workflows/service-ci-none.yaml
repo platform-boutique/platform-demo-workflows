@@ -5,7 +5,7 @@ name: Service CI (no language pipeline)
 # The pull-request pipeline of a repository without a language pipeline, flat: every job is in this file and nothing is called from here, so the Actions graph shows
 # exactly what runs, left to right, with plain names (`ci / Build`):
 #
-#   Detect changes | Secret scan | Workflow lint   (no needs: start at t=0)
+#   Detect changes | Secret scan | Workflow lint | Docs check   (no needs: start at t=0)
 #   Image build and scan
 #            (need only `Detect changes`; a docs-only change skips them, the guards still run)
 #   gate     (needs every job, always runs, names the job that failed first)
@@ -234,6 +234,152 @@ jobs:
           tar xzf actionlint.tgz actionlint
           ./actionlint -color
 
+  docs:
+    name: "Docs check"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      present: ${{ steps.site.outputs.present }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Look for mkdocs.yml
+        id: site
+        run: |
+          set -euo pipefail
+          if [ -f mkdocs.yml ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "no mkdocs.yml in this repository: nothing to check"
+          fi
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: steps.site.outputs.present == 'true'
+        with:
+          python-version: "3.13"
+
+      - name: Install mkdocs
+        if: steps.site.outputs.present == 'true'
+        run: pip install --quiet --disable-pip-version-check mkdocs==1.6.1 mkdocs-techdocs-core==1.7.1
+
+      - name: Build the docs (mkdocs build --strict)
+        id: build
+        if: steps.site.outputs.present == 'true'
+        run: mkdocs build --strict --site-dir "$RUNNER_TEMP/site"
+
+      - name: Check relative markdown links
+        id: links
+        if: ${{ !cancelled() && steps.site.outputs.present == 'true' }}
+        run: |
+          python3 -I - . <<'PY'
+          #!/usr/bin/env python3
+          """Markdown link check of an app repository (DOC-12): every relative link of README.md and of the pages under docs/ must point to
+          a file or directory that exists. Python 3 standard library only.
+
+          usage: check-md-links.py [repo-dir]       (default: the current directory)    exit 1 and one line per broken link
+
+            * checked: inline links and images `[text](path)`, reference definitions `[id]: path`; the path is resolved against the directory
+              of the page that holds the link (a path that starts with `/` against the repository root, as GitHub does);
+            * not checked: http(s)/mailto/... links (they need the network and fail for reasons that are not the repository's), `#anchors`
+              (the heading slugs of GitHub and of mkdocs differ), links with a `{{ template }}`;
+            * code is not text: fenced code blocks and inline code spans are skipped;
+            * the pages are README.md and every `*.md` under `docs_dir` of mkdocs.yml (default `docs`).
+
+          This file is the single source: tools/gen-service-ci.py puts it into the `Docs check` job of service-ci-<language>.yaml as written
+          here, and tools/test-md-links.py tests it.
+          """
+          import os, re, sys
+          from urllib.parse import unquote
+
+          root = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else ".")
+
+          docs_dir = "docs"
+          if os.path.isfile(os.path.join(root, "mkdocs.yml")):
+              with open(os.path.join(root, "mkdocs.yml"), encoding="utf-8") as f:
+                  m = re.search(r"^docs_dir:\s*['\"]?([^'\"\s#]+)", f.read(), re.M)
+              if m:
+                  docs_dir = m.group(1).rstrip("/")
+
+          pages = []
+          if os.path.isfile(os.path.join(root, "README.md")):
+              pages.append("README.md")
+          for base, dirs, files in os.walk(os.path.join(root, docs_dir)):
+              dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+              pages += [os.path.relpath(os.path.join(base, n), root) for n in sorted(files) if n.endswith(".md")]
+
+          INLINE = re.compile(r"!?\[[^\]]*\]\(\s*(<[^>]*>|[^)\s]*)(?:\s+(?:\"[^\"]*\"|'[^']*'))?\s*\)")
+          REFDEF = re.compile(r"^ {0,3}\[[^\]]+\]:\s*(<[^>]*>|\S+)")
+          SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+          FENCE = re.compile(r"^ {0,3}(```|~~~)")
+
+          broken, checked = [], 0
+          for page in pages:
+              with open(os.path.join(root, page), encoding="utf-8", errors="replace") as f:
+                  lines = f.read().split("\n")
+              fence = None
+              for n, line in enumerate(lines, 1):
+                  m = FENCE.match(line)
+                  if m:
+                      if fence is None:
+                          fence = m.group(1)
+                      elif m.group(1) == fence:
+                          fence = None
+                      continue
+                  if fence is not None:
+                      continue
+                  text = re.sub(r"`[^`]*`", "", line)
+                  targets = [t for t in INLINE.findall(text)]
+                  r = REFDEF.match(text)
+                  if r:
+                      targets.append(r.group(1))
+                  for t in targets:
+                      t = t.strip("<>")
+                      if not t or t.startswith("#") or SCHEME.match(t) or t.startswith("//") or "{{" in t:
+                          continue
+                      path = unquote(re.split(r"[#?]", t, 1)[0])
+                      if not path:
+                          continue
+                      full = os.path.join(root, path.lstrip("/")) if path.startswith("/") else os.path.join(root, os.path.dirname(page), path)
+                      checked += 1
+                      if not os.path.exists(os.path.normpath(full)):
+                          broken.append((page, n, t))
+
+          for page, n, t in broken:
+              print(f"::error file={page},line={n}::broken link: {t}")
+              print(f"{page}:{n}: broken link -> {t}")
+          print(f"markdown links: {checked} relative links in {len(pages)} pages, {len(broken)} broken")
+          sys.exit(1 if broken else 0)
+          PY
+
+      - name: Write the docs summary
+        if: ${{ !cancelled() }}
+        env:
+          PRESENT: ${{ steps.site.outputs.present }}
+          BUILD: ${{ steps.build.outcome }}
+          LINKS: ${{ steps.links.outcome }}
+        run: |
+          set -euo pipefail
+          words() { case "$1" in success) echo passed ;; failure) echo "**failed**" ;; skipped) echo "not run" ;; *) echo "not run" ;; esac; }
+          {
+            echo "### Docs check"
+            echo
+            if [ "$PRESENT" != true ]; then
+              echo "This repository has no \`mkdocs.yml\`, so there is nothing to check."
+            else
+              echo "| | |"
+              echo "|---|---|"
+              echo "| \`mkdocs build --strict\` | $(words "$BUILD") |"
+              echo "| relative links in README.md and docs/ | $(words "$LINKS") |"
+              echo
+              echo "External links and \`#anchors\` are not checked. The details are in the log of each step."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   image:
     name: "Image build and scan"
     needs: [changes]
@@ -333,6 +479,38 @@ jobs:
             echo "tree $tree: $note"
           fi
 
+      - name: Name this build (version, commit, time)
+        id: buildinfo
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            # the pull request's own head commit, not the merge commit that is checked out (the same value as the revision label)
+            commit=$PR_HEAD_SHA
+            if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+              echo "::error::unexpected pull request number '$PR_NUMBER'"
+              exit 1
+            fi
+            version="0.0.0-pr.$PR_NUMBER"
+          else
+            commit=$GITHUB_SHA
+            version="0.0.0-sha.${commit:0:7}"
+          fi
+          if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::unexpected commit '$commit'"
+            exit 1
+          fi
+          build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          {
+            echo "version=$version"
+            echo "commit=$commit"
+            echo "build-time=$build_time"
+          } >> "$GITHUB_OUTPUT"
+          echo "build-args: SERVICE_VERSION=$version SERVICE_COMMIT=$commit BUILD_TIME=$build_time"
+
       - name: Build the image
         id: build
         if: steps.find.outputs.found != 'true'
@@ -343,10 +521,17 @@ jobs:
           push: ${{ steps.mode.outputs.push == 'true' }}
           load: ${{ steps.mode.outputs.push != 'true' }}
           tags: ${{ steps.mode.outputs.push == 'true' && steps.find.outputs.tag-ref || 'service-ci-scan:local' }}
+          # what the Dockerfile may use (ARG SERVICE_VERSION / SERVICE_COMMIT / BUILD_TIME; an undeclared one is ignored)
+          build-args: |
+            SERVICE_VERSION=${{ steps.buildinfo.outputs.version }}
+            SERVICE_COMMIT=${{ steps.buildinfo.outputs.commit }}
+            BUILD_TIME=${{ steps.buildinfo.outputs.build-time }}
           # where it was built (the signature of the published image names the commit that was shipped)
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.event.pull_request.head.sha || github.sha }}
+            org.opencontainers.image.revision=${{ steps.buildinfo.outputs.commit }}
+            org.opencontainers.image.version=${{ steps.buildinfo.outputs.version }}
+            org.opencontainers.image.created=${{ steps.buildinfo.outputs.build-time }}
             io.platform-demo.tree=${{ steps.find.outputs.tree }}
             io.platform-demo.build-run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # a run that pushes the image (same repository, not Dependabot) also refreshes the cache; a fork's or Dependabot's run only reads it
@@ -436,7 +621,7 @@ jobs:
 
   gate:
     name: "gate"
-    needs: [changes, secret-scan, workflow-lint, image]
+    needs: [changes, secret-scan, workflow-lint, docs, image]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -447,14 +632,15 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
           IMAGE: ${{ inputs.image }}
           CODE: ${{ needs.changes.outputs.code }}
+          DOCS: ${{ needs.docs.outputs.present }}
           EVENT: ${{ github.event_name }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           ACTOR: ${{ github.actor }}
         run: |
           # Jobs this workflow has, in the order of the graph: the three guards, then the checks (generated per language), and their names.
-          guards=" changes secret-scan workflow-lint "
+          guards=" changes secret-scan workflow-lint docs "
           checks=" image "
-          declare -A names=([changes]="Detect changes" [secret-scan]="Secret scan" [workflow-lint]="Workflow lint" [image]="Image build and scan")
+          declare -A names=([changes]="Detect changes" [secret-scan]="Secret scan" [workflow-lint]="Workflow lint" [docs]="Docs check" [image]="Image build and scan")
 
           # Text that does not come from this script (an unknown job id, a result) is shown with letters, digits and . _ - only.
           safe() { printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9._-' '?' | cut -c1-60; }
@@ -535,6 +721,7 @@ jobs:
               if [ "$res" = skipped ]; then
                 if [ "$CODE" = "false" ]; then cell="skipped: documentation only"; else cell="skipped: no image pipeline"; fi
               fi
+              if [ "$job" = docs ] && [ "$res" = success ] && [ "$DOCS" = false ]; then cell="passed: no mkdocs.yml, nothing to check"; fi
             elif [ "$failed" = 1 ]; then
               cell=$(words "$res")
             else

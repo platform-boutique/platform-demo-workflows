@@ -87,11 +87,11 @@ COMMON_INPUTS = """\
         default: ""
 """
 
-GUARDS = ["changes", "secret-scan", "workflow-lint"]
+GUARDS = ["changes", "secret-scan", "workflow-lint", "docs"]
 # Job names: sentence case, what the job does, no group prefixes (the caller's job id is the prefix GitHub shows: `ci / Build`).
 # Language detail belongs in the step names. The same names in all six files (tools/check-consistency.py pins them).
 NAMES = {
-    "changes": "Detect changes", "secret-scan": "Secret scan", "workflow-lint": "Workflow lint",
+    "changes": "Detect changes", "secret-scan": "Secret scan", "workflow-lint": "Workflow lint", "docs": "Docs check",
     "lint": "Lint", "build": "Build", "test": "Tests",
     "sca": "Dependency scan", "sast": "Code scan", "image": "Image build and scan", "gate": "gate",
 }
@@ -146,6 +146,83 @@ def guard_jobs():
         jobs.append(render_job(key, j.steps, timeout=j.timeout(), perms=j.raw("permissions"),
                                outputs=j.raw("outputs") if "outputs" in j.fields else None))
     return jobs
+
+
+# The docs check (DOC-12): `mkdocs build --strict` and the relative-link check, only for a repository that has an mkdocs.yml. It is a
+# guard of the graph (no needs, starts at t=0, runs for a documentation-only change too: that is the change it exists for), and it
+# always ends green when there is nothing to check, so the gate has one rule for it. The versions are fixed here (no workflow input):
+# at least 7 days old when chosen, bumped by hand in this one place (Dependabot does not read pip commands in a workflow).
+MKDOCS_VERSION = "1.6.1"
+TECHDOCS_CORE_VERSION = "1.7.1"  # pins mkdocs-material and the other plugins itself
+DOCS_PYTHON = "3.13"
+
+
+def docs_job():
+    with open(os.path.join(HERE, "check-md-links.py")) as f:
+        links = f.read().rstrip("\n")
+    assert "\nPY\n" not in links and "${{" not in links, "tools/check-md-links.py cannot be embedded as a heredoc"
+    install = (f"pip install --quiet --disable-pip-version-check mkdocs=={MKDOCS_VERSION} mkdocs-techdocs-core=={TECHDOCS_CORE_VERSION}")
+    steps = [
+        wfgen.checkout_step(),
+        ("      - name: Look for mkdocs.yml\n"
+         "        id: site\n"
+         "        run: |\n" + wfgen.script(DOCS_SITE_SCRIPT)),
+        (f"      - uses: {wfgen.pin('actions/setup-python')}\n"
+         "        if: steps.site.outputs.present == 'true'\n"
+         "        with:\n"
+         f"          python-version: \"{DOCS_PYTHON}\""),
+        ("      - name: Install mkdocs\n"
+         "        if: steps.site.outputs.present == 'true'\n"
+         "        run: " + install),
+        ("      - name: Build the docs (mkdocs build --strict)\n"
+         "        id: build\n"
+         "        if: steps.site.outputs.present == 'true'\n"
+         "        run: mkdocs build --strict --site-dir \"$RUNNER_TEMP/site\""),
+        # the link check runs after a failed build too: both findings in one run
+        ("      - name: Check relative markdown links\n"
+         "        id: links\n"
+         "        if: ${{ !cancelled() && steps.site.outputs.present == 'true' }}\n"
+         "        run: |\n" + wfgen.script("python3 -I - . <<'PY'\n" + links + "\nPY")),
+        ("      - name: Write the docs summary\n"
+         "        if: ${{ !cancelled() }}\n"
+         "        env:\n"
+         "          PRESENT: ${{ steps.site.outputs.present }}\n"
+         "          BUILD: ${{ steps.build.outcome }}\n"
+         "          LINKS: ${{ steps.links.outcome }}\n"
+         "        run: |\n" + wfgen.script(DOCS_SUMMARY_SCRIPT)),
+    ]
+    return render_job("docs", steps, timeout=10, perms="    permissions:\n      contents: read",
+                      outputs="    outputs:\n      present: ${{ steps.site.outputs.present }}")
+
+
+DOCS_SITE_SCRIPT = r"""
+set -euo pipefail
+if [ -f mkdocs.yml ]; then
+  echo "present=true" >> "$GITHUB_OUTPUT"
+else
+  echo "present=false" >> "$GITHUB_OUTPUT"
+  echo "no mkdocs.yml in this repository: nothing to check"
+fi
+"""
+
+DOCS_SUMMARY_SCRIPT = r"""
+set -euo pipefail
+words() { case "$1" in success) echo passed ;; failure) echo "**failed**" ;; skipped) echo "not run" ;; *) echo "not run" ;; esac; }
+{
+  echo "### Docs check"
+  echo
+  if [ "$PRESENT" != true ]; then
+    echo "This repository has no \`mkdocs.yml\`, so there is nothing to check."
+  else
+    echo "| | |"
+    echo "|---|---|"
+    echo "| \`mkdocs build --strict\` | $(words "$BUILD") |"
+    echo "| relative links in README.md and docs/ | $(words "$LINKS") |"
+    echo
+    echo "External links and \`#anchors\` are not checked. The details are in the log of each step."
+  fi
+} >> "$GITHUB_STEP_SUMMARY"
+"""
 
 
 def lang_jobs(lang):
@@ -214,6 +291,7 @@ def image_steps():
                                  "its failed login must not fail the pull request"),
         wfgen.cache_step(),
         wfgen.find_step("${{ steps.mode.outputs.push }}"),
+        wfgen.buildinfo_step(),
         wfgen.build_step(push="expr", cache_write="when-pushing"),
         wfgen.record_step("${{ steps.mode.outputs.push }}"),
         wfgen.trivy_step("${{ steps.image.outputs.ref }}",
@@ -315,6 +393,7 @@ for job in $guards $checks "${unknown[@]}"; do
     if [ "$res" = skipped ]; then
       if [ "$CODE" = "false" ]; then cell="skipped: documentation only"; else cell="skipped: no image pipeline"; fi
     fi
+    if [ "$job" = docs ] && [ "$res" = success ] && [ "$DOCS" = false ]; then cell="passed: no mkdocs.yml, nothing to check"; fi
   elif [ "$failed" = 1 ]; then
     cell=$(words "$res")
   else
@@ -389,6 +468,7 @@ def gate_job(lang):
         "          NEEDS: ${{ toJSON(needs) }}\n"
         "          IMAGE: ${{ inputs.image }}\n"
         "          CODE: ${{ needs.changes.outputs.code }}\n"
+        "          DOCS: ${{ needs.docs.outputs.present }}\n"
         "          EVENT: ${{ github.event_name }}\n"
         "          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}\n"
         "          ACTOR: ${{ github.actor }}\n"
@@ -456,7 +536,7 @@ def render(lang):
                  "# The optional smoke test (input smoke-port) is a step of Build: no extra job, and it reuses the build.\n")
     grant = "contents: read and packages: write (the image job pushes the tree image)" + (" and checks: write (the test reporter)" if lang == "dotnet" else "")
     head = HEADER.format(title=TITLE[lang], who=who, s1=s1, s2=s2, notes=notes, file=file, grant=grant, inputs=inputs_block(lang))
-    jobs = guard_jobs() + (lang_jobs(lang) if lang != "none" else []) + [image_job(), gate_job(lang)]
+    jobs = guard_jobs() + [docs_job()] + (lang_jobs(lang) if lang != "none" else []) + [image_job(), gate_job(lang)]
     text = head + "\n".join(jobs)
     assert not re.search(r"[ \t]+$", text, re.M), f"{file}: trailing whitespace"
     # every `inputs.<name>` used must be declared in this file

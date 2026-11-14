@@ -36,9 +36,36 @@ A re-run is cheap and consistent: the build pushed the tag, so the second run fi
   signature verified, the helm pull requests (the exact one is in the summary of `Open dev PR`). More in "Job names and run summaries" in
   [How a service calls them](calling.md).
 - OCI labels on the image: `org.opencontainers.image.source`, `org.opencontainers.image.revision` (the commit the image was **built** at:
-  a pull request's head commit, or the main commit when the publish built it), `io.platform-demo.tree`, `io.platform-demo.build-run`
+  a pull request's head commit, or the main commit when the publish built it), `org.opencontainers.image.version` and
+  `org.opencontainers.image.created` (since v3.7.0, see "Build identity" below), `io.platform-demo.tree`, `io.platform-demo.build-run`
   (the run that built it). The commit that was **shipped** is in the cosign certificate and in the `sha-<7>` tag.
 - The keyless signature's identity is `service-publish.yaml@<sha>` of this repository.
+
+## Build identity (build-args, since v3.7.0)
+
+Both image builds (the pull request's `Image build and scan` and the publish's `Find or build image`) pass the same three build-args,
+computed by a step `Name this build (version, commit, time)` that runs right before the build:
+
+| build-arg | pull request | publish (push to `main`, manual run) |
+|---|---|---|
+| `SERVICE_VERSION` | `0.0.0-pr.<pull request number>` | `0.0.0-sha.<first 7 characters of the commit>` |
+| `SERVICE_COMMIT` | the pull request's head commit (40 characters, not the merge commit that is checked out) | the commit on `main` (`github.sha`) |
+| `BUILD_TIME` | RFC 3339 UTC, e.g. `2026-11-14T12:00:00Z` | the same |
+
+- **The `v1.0.x` version of stage and prod is not known at build time.** It is computed after the build (`Release stage version`), from the
+  highest `<app>-vX.Y.Z` tag, so the image cannot carry it. The version baked into the image is derived from the commit (or the pull
+  request) on purpose; the release version is the helm tag / the tag of the release, the commit is the link between the two.
+- **A reused image keeps the identity of the run that built it.** When the publish finds the pull request's `tree-<hash>` image it ships
+  that image, so a published image usually says `0.0.0-pr.<N>` and the pull request's head commit; only an image the publish builds itself
+  says `0.0.0-sha.<7>`. (The `revision` label always worked this way; the `sha-<7>` tag and the cosign certificate name the commit that
+  was shipped.)
+- The Dockerfiles of the app repositories declare `ARG SERVICE_VERSION=dev` and `ARG SERVICE_COMMIT=unknown` (labels, process environment,
+  `internal/obs`). **`BUILD_TIME` is optional:** a Dockerfile that does not declare `ARG BUILD_TIME` simply ignores it (BuildKit does not
+  fail on an unused build-arg; tested with `docker build --build-arg` of an undeclared name, exit 0). Declare it late in the Dockerfile
+  (a `LABEL`/`ENV` in the final stage, or a `-X ...BuildTime=${BUILD_TIME}` in the build stage if the module has the symbol): it changes on every build, so every layer
+  after the `ARG` is rebuilt; an early `ARG BUILD_TIME` would defeat the build cache.
+- The pipeline also sets the labels `org.opencontainers.image.version` (= `SERVICE_VERSION`) and `org.opencontainers.image.created`
+  (= `BUILD_TIME`) itself, so they exist even for a Dockerfile that declares neither; a `--label` of the build wins over a `LABEL` line.
 
 ## Limits worth knowing
 

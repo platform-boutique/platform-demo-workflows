@@ -45,6 +45,10 @@ jobs:
       - name: Generator scenarios
         run: python3 tools/test-generators.py
 
+      # the markdown link check of the `Docs check` job (tools/check-md-links.py)
+      - name: Link check scenarios
+        run: python3 tools/test-md-links.py
+
       # the shell of the image lookup, the Docker Hub copy, change detection with `before`, the prune, the merge job and the tag button,
       # run against stubs of docker/gh/curl and real git repositories
       - name: Shell scenarios

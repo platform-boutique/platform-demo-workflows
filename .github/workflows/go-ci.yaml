@@ -174,7 +174,19 @@ jobs:
           TEST_PACKAGES: ${{ inputs.test-packages }}
         run: |
           read -ra packages <<< "$TEST_PACKAGES"
-          go test "${packages[@]}" -v -race -count=1
+          # TEST-06: coverage is reported, never gated (no threshold until the baseline is known)
+          go test "${packages[@]}" -v -race -count=1 -coverprofile="$RUNNER_TEMP/coverage.out"
+          go tool cover -func="$RUNNER_TEMP/coverage.out" > "$RUNNER_TEMP/coverage.txt"
+          total=$(tail -n 1 "$RUNNER_TEMP/coverage.txt" | awk '{print $NF}')
+          echo "::group::Coverage per function"
+          cat "$RUNNER_TEMP/coverage.txt"
+          echo "::endgroup::"
+          echo "Total statement coverage: $total"
+          {
+            echo "### Coverage"
+            echo
+            echo "Statement coverage of the tested packages: **$total** (reported only, there is no coverage gate)."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ─── security scans (all jobs run in parallel) ────────────────────────────
 

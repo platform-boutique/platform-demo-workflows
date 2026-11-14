@@ -107,7 +107,7 @@ COMMON_INPUTS = ["image", "context", "dockerfile", "trivyignores"]
 GUARDS = {"changes": ("changed-paths.yaml", "detect"), "secret-scan": ("secret-scan.yaml", "secret-scan"),
           "workflow-lint": ("workflow-lint.yaml", "actionlint")}
 # Job names: sentence case, what the job does, no group prefixes. The caller's job id (`ci`, `publish`) is the prefix GitHub shows.
-JOB_NAMES = {"changes": "Detect changes", "secret-scan": "Secret scan", "workflow-lint": "Workflow lint", "lint": "Lint",
+JOB_NAMES = {"changes": "Detect changes", "secret-scan": "Secret scan", "workflow-lint": "Workflow lint", "docs": "Docs check", "lint": "Lint",
              "build": "Build", "test": "Tests", "sca": "Dependency scan", "sast": "Code scan",
              "image": "Image build and scan", "gate": "gate"}
 PREFIXED = re.compile(r"^[A-Za-z]+: ")  # `Guard: Changes`, `Image: Scan`, ...: the old group prefixes
@@ -174,7 +174,7 @@ for lang in ["go", "node", "python", "java", "dotnet", "none"]:
             if a.get(field) != b.get(field):
                 problems.append(f"{fname}: job {jid} differs from {orig_file} ({orig_job}) in {field}")
     # graph and names
-    expected = {"changes", "secret-scan", "workflow-lint", "image", "gate"} | (set() if lang == "none" else {"lint", "build", "test", "sca", "sast"})
+    expected = {"changes", "secret-scan", "workflow-lint", "docs", "image", "gate"} | (set() if lang == "none" else {"lint", "build", "test", "sca", "sast"})
     if set(jobs) != expected:
         problems.append(f"{fname}: jobs are {sorted(jobs)}, expected {sorted(expected)}")
     for jid, j in jobs.items():
@@ -182,7 +182,9 @@ for lang in ["go", "node", "python", "java", "dotnet", "none"]:
             problems.append(f"{fname}: job {jid} is named {j.get('name')!r}, expected {JOB_NAMES.get(jid)!r}")
         if jid in GUARDS and "needs" in j:
             problems.append(f"{fname}: guard {jid} has needs; the guards start at t=0")
-        elif jid not in GUARDS and jid != "gate" and j.get("needs") != ["changes"]:
+        elif jid == "docs" and "needs" in j:
+            problems.append(f"{fname}: the docs check has needs; it starts at t=0 and also runs for a documentation-only change")
+        elif jid not in GUARDS and jid not in ("docs", "gate") and j.get("needs") != ["changes"]:
             problems.append(f"{fname}: job {jid} needs {j.get('needs')}, expected [changes] only")
     gate = jobs.get("gate", {})
     # the gate's summary shows the same names (generated from the same table) and keys on job ids
@@ -190,7 +192,7 @@ for lang in ["go", "node", "python", "java", "dotnet", "none"]:
     shown = dict(re.findall(r'\[([a-z-]+)\]="([^"]*)"', gate_step.get("run", "").split("declare -A names=(", 1)[-1].split(")\n", 1)[0]))
     if shown != {k: v for k, v in JOB_NAMES.items() if k in jobs and k != "gate"}:
         problems.append(f"{fname}: the gate lists the names {shown}, which are not the names of the jobs")
-    for var in ("EVENT", "HEAD_REPO", "ACTOR", "CODE", "IMAGE", "NEEDS"):
+    for var in ("EVENT", "HEAD_REPO", "ACTOR", "CODE", "IMAGE", "NEEDS", "DOCS"):
         if var not in gate_step.get("env", {}):
             problems.append(f"{fname}: the gate step has no env {var}")
     if sorted(gate.get("needs", [])) != sorted(k for k in jobs if k != "gate"):
@@ -420,7 +422,7 @@ if len(copy_runs) != 1 or copy_runs[0].count("--tag") != 1 or 'tag="sha-${GITHUB
     problems.append("service-publish.yaml: the Docker Hub copy must make exactly one tag, sha-<first 7 chars of the commit>")
 # steps shared with the pull-request image job are the same text
 for lang, image in flat_images.items():
-    for sid in ("find", "image", "mode", "cache"):
+    for sid in ("find", "buildinfo", "image", "mode", "cache"):
         a, b = step_by_id(image, sid), step_by_id(pj["image"], sid)
         if sid == "mode":
             continue  # only the pull-request workflows decide whether a run may push
@@ -435,6 +437,15 @@ for lang, image in flat_images.items():
     a, b = step_by_id(image, "build"), step_by_id(pj["image"], "build")
     if a is None or b is None or a["with"]["labels"] != b["with"]["labels"] or a["uses"] != b["uses"]:
         problems.append(f"service-ci-{lang}.yaml: build step labels or pin differ from service-publish.yaml")
+    # the build identity (CODE-06 / IMG-05): the same three build-args in both pipelines, taken from the `buildinfo` step that runs before the build
+    want_args = ("SERVICE_VERSION=${{ steps.buildinfo.outputs.version }}\nSERVICE_COMMIT=${{ steps.buildinfo.outputs.commit }}\n"
+                 "BUILD_TIME=${{ steps.buildinfo.outputs.build-time }}\n")
+    ids_ = [s_.get("id") for s_ in image["steps"]]
+    for where_, step_ in ((f"service-ci-{lang}.yaml", a), ("service-publish.yaml", b)):
+        if step_ is None or step_["with"].get("build-args") != want_args:
+            problems.append(f"{where_}: the image build must pass build-args SERVICE_VERSION, SERVICE_COMMIT and BUILD_TIME from the buildinfo step")
+    if "buildinfo" not in ids_ or ids_.index("buildinfo") > ids_.index("build"):
+        problems.append(f"service-ci-{lang}.yaml: the buildinfo step must come before the build")
     ta = [s_ for s_ in image["steps"] if str(s_.get("uses", "")).startswith("aquasecurity/trivy-action")]
     tb = [s_ for s_ in pj["scan"]["steps"] if str(s_.get("uses", "")).startswith("aquasecurity/trivy-action")]
     if len(ta) != 1 or len(tb) != 1 or {k: v for k, v in ta[0]["with"].items() if k != "image-ref"} != {k: v for k, v in tb[0]["with"].items() if k != "image-ref"}:
