@@ -367,7 +367,14 @@ jobs:
         run: npm ci
 
       - name: Run unit tests
-        run: npm run test:ci
+        run: |
+          # TEST-06: when the repository's test:ci script runs jest, jest also prints the coverage (nothing to install, no threshold);
+          # any other runner is left as it is
+          if npm pkg get "scripts.test:ci" | grep -q jest; then
+            npm run test:ci -- --coverage --coverageReporters=text-summary --coverageReporters=text
+          else
+            npm run test:ci
+          fi
 
   sca:
     name: "Dependency scan"

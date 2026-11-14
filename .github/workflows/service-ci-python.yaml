@@ -330,7 +330,14 @@ jobs:
       - name: Run unit tests
         env:
           TESTS_PATH: ${{ inputs.tests-path }}
-        run: pytest "$TESTS_PATH" -v --tb=short
+          SOURCE_DIR: ${{ inputs.source-dir }}
+        run: |
+          # TEST-06: coverage is printed when pytest-cov is already a dev dependency of the repository (nothing is added, no threshold)
+          if python -c "import pytest_cov" 2>/dev/null; then
+            pytest "$TESTS_PATH" -v --tb=short --cov="$SOURCE_DIR" --cov-report=term
+          else
+            pytest "$TESTS_PATH" -v --tb=short
+          fi
 
   sca:
     name: "Dependency scan"
