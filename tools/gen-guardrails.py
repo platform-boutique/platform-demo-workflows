@@ -24,7 +24,12 @@ if not dependabot_only:
 #  - Docker base images (golang, node, python, temurin, ...) ignore minor versions too: toolchain upgrades are deliberate
 #  - these rules live in this file, NOT in Dependabot's per-repository memory (`@dependabot ignore ...`), which a repository
 #    transfer wipes. Security updates are a separate mechanism and stay enabled in the repository settings.
+#  - GitHub rule (docs: "Configuring multi-ecosystem updates for Dependabot", section "Configuration merging behavior"): milestone,
+#    commit-message, target-branch and pull-request-branch-name are GROUP-ONLY options; setting one on an update that belongs to a group
+#    is a configuration error and the whole file is rejected (that is what silently disabled this policy on 2026-10-17). So the commit
+#    message prefix is written on the group below, never in block().
 GROUP = "dependencies"
+COMMIT_PREFIX = "chore(deps)"
 
 def block(eco, directory=None, directories=None):
     d = f"    directory: {directory}\n" if directory else "    directories:\n" + "".join(f'      - "{x}"\n' for x in directories)
@@ -35,8 +40,6 @@ def block(eco, directory=None, directories=None):
     patterns: ["*"]
     cooldown:
       default-days: 7 # let a new release settle before it is proposed
-    commit-message:
-      prefix: "chore(deps)"
     ignore:
       - dependency-name: "*"
         update-types:
@@ -47,6 +50,8 @@ multi-ecosystem-groups:
   {GROUP}:
     schedule:
       interval: monthly
+    commit-message:
+      prefix: "{COMMIT_PREFIX}"
 updates:
 """
 for e in ecos:

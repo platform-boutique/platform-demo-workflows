@@ -41,6 +41,10 @@ jobs:
       - name: Gate scenarios
         run: python3 tools/test-gate.py
 
+      # the generators of the app repositories' files: Dependabot's multi-ecosystem rules, publish on/off, the new services
+      - name: Generator scenarios
+        run: python3 tools/test-generators.py
+
       # the shell of the image lookup, the Docker Hub copy, change detection with `before`, the prune, the merge job and the tag button,
       # run against stubs of docker/gh/curl and real git repositories
       - name: Shell scenarios
