@@ -104,12 +104,19 @@ for name in sorted(os.listdir(wfdir)):
 LANG_WF = {"go": "go-ci.yaml", "node": "node-ci.yaml", "python": "python-ci.yaml", "java": "java-gradle-ci.yaml", "dotnet": "dotnet-ci.yaml"}
 TOOL_INPUTS = {"golangci-lint-version", "govulncheck-version", "gosec-version", "semgrep-version", "ruff-version", "pip-audit-version", "bandit-version"}
 COMMON_INPUTS = ["image", "context", "dockerfile", "trivyignores"]
+# v3.8.0 inputs that exist only in the service pipeline (not in a stand-alone workflow): name -> (type, default). The first four are in
+# all six files, integration-command in the five language files, java-lint-enforce in the java file. Every one is optional and its default
+# keeps today's behaviour (report only / no integration job), except proto-breaking-enforce whose default holds on all 15 app repositories.
+SERVICE_COMMON = {"proto-dir": ("string", ""), "proto-lint-enforce": ("boolean", False), "proto-breaking-enforce": ("boolean", True),
+                  "shellcheck-enforce": ("boolean", False)}
+SERVICE_LANG = {"integration-command": ("string", "")}
+SERVICE_JAVA = {"java-lint-enforce": ("boolean", False)}
 GUARDS = {"changes": ("changed-paths.yaml", "detect"), "secret-scan": ("secret-scan.yaml", "secret-scan"),
           "workflow-lint": ("workflow-lint.yaml", "actionlint")}
 # Job names: sentence case, what the job does, no group prefixes. The caller's job id (`ci`, `publish`) is the prefix GitHub shows.
 JOB_NAMES = {"changes": "Detect changes", "secret-scan": "Secret scan", "workflow-lint": "Workflow lint", "docs": "Docs check", "lint": "Lint",
-             "build": "Build", "test": "Tests", "sca": "Dependency scan", "sast": "Code scan",
-             "image": "Image build and scan", "gate": "gate"}
+             "proto": "Proto check", "shell": "Shell check", "build": "Build", "test": "Tests", "integration": "Integration tests",
+             "sca": "Dependency scan", "sast": "Code scan", "image": "Image build and scan", "gate": "gate"}
 PREFIXED = re.compile(r"^[A-Za-z]+: ")  # `Guard: Changes`, `Image: Scan`, ...: the old group prefixes
 
 for fname in LANG_WF.values():
@@ -146,7 +153,7 @@ for lang in ["go", "node", "python", "java", "dotnet", "none"]:
     if lang != "none":
         std = load(LANG_WF[lang])["on"]["workflow_call"]["inputs"]
         for k, v in ins.items():
-            if k in COMMON_INPUTS:
+            if k in COMMON_INPUTS or k in SERVICE_COMMON or k in SERVICE_LANG or k in SERVICE_JAVA:
                 continue
             if k not in std:
                 problems.append(f"{fname}: input {k} does not exist in {LANG_WF[lang]}")
@@ -160,6 +167,15 @@ for lang in ["go", "node", "python", "java", "dotnet", "none"]:
     for k in COMMON_INPUTS:
         if k not in ins:
             problems.append(f"{fname}: common input {k} is missing")
+    want_new = {**SERVICE_COMMON, **(SERVICE_LANG if lang != "none" else {}), **(SERVICE_JAVA if lang == "java" else {})}
+    for k, (typ, default) in want_new.items():
+        if k not in ins:
+            problems.append(f"{fname}: input {k} is missing")
+        elif ins[k].get("type") != typ or ins[k].get("default") != default or ins[k].get("required"):
+            problems.append(f"{fname}: input {k} must be an optional {typ} with default {default!r}, is {ins[k]}")
+    for k in list(SERVICE_LANG) + list(SERVICE_JAVA):
+        if k in ins and k not in want_new:
+            problems.append(f"{fname}: input {k} does not belong in this file")
     if flat_common is None:
         flat_common = {k: ins.get(k) for k in COMMON_INPUTS}
     elif {k: ins.get(k) for k in COMMON_INPUTS} != flat_common:
@@ -174,7 +190,8 @@ for lang in ["go", "node", "python", "java", "dotnet", "none"]:
             if a.get(field) != b.get(field):
                 problems.append(f"{fname}: job {jid} differs from {orig_file} ({orig_job}) in {field}")
     # graph and names
-    expected = {"changes", "secret-scan", "workflow-lint", "docs", "image", "gate"} | (set() if lang == "none" else {"lint", "build", "test", "sca", "sast"})
+    expected = {"changes", "secret-scan", "workflow-lint", "docs", "proto", "shell", "image", "gate"} | (
+        set() if lang == "none" else {"lint", "build", "test", "integration", "sca", "sast"})
     if set(jobs) != expected:
         problems.append(f"{fname}: jobs are {sorted(jobs)}, expected {sorted(expected)}")
     for jid, j in jobs.items():
@@ -192,7 +209,7 @@ for lang in ["go", "node", "python", "java", "dotnet", "none"]:
     shown = dict(re.findall(r'\[([a-z-]+)\]="([^"]*)"', gate_step.get("run", "").split("declare -A names=(", 1)[-1].split(")\n", 1)[0]))
     if shown != {k: v for k, v in JOB_NAMES.items() if k in jobs and k != "gate"}:
         problems.append(f"{fname}: the gate lists the names {shown}, which are not the names of the jobs")
-    for var in ("EVENT", "HEAD_REPO", "ACTOR", "CODE", "IMAGE", "NEEDS", "DOCS"):
+    for var in ("EVENT", "HEAD_REPO", "ACTOR", "CODE", "IMAGE", "NEEDS", "DOCS", "INTEGRATION"):
         if var not in gate_step.get("env", {}):
             problems.append(f"{fname}: the gate step has no env {var}")
     if sorted(gate.get("needs", [])) != sorted(k for k in jobs if k != "gate"):

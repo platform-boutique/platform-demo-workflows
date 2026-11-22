@@ -6,7 +6,7 @@ name: Service CI (Java)
 # exactly what runs, left to right, with plain names (`ci / Build`):
 #
 #   Detect changes | Secret scan | Workflow lint | Docs check   (no needs: start at t=0)
-#   Lint | Build | Tests | Dependency scan | Code scan | Image build and scan
+#   Lint | Proto check | Shell check | Build | Tests | Integration tests | Dependency scan | Code scan | Image build and scan
 #            (need only `Detect changes`; a docs-only change skips them, the guards still run)
 #   gate     (needs every job, always runs, names the job that failed first)
 #
@@ -35,6 +35,22 @@ on:
         description: Path to a .trivyignore file in the caller repo (optional)
         type: string
         default: ""
+      proto-dir:
+        description: Directory with the .proto files (the buf module root). Empty looks for proto, src/main/proto and src/protos; a repository without any skips the Proto check.
+        type: string
+        default: ""
+      proto-lint-enforce:
+        description: Fail the Proto check on buf lint findings (MINIMAL rules without PACKAGE_DIRECTORY_MATCH). false = report only, the findings are in the run summary.
+        type: boolean
+        default: false
+      proto-breaking-enforce:
+        description: Fail the Proto check when the pull request breaks the wire contract of the default branch (buf breaking, FILE rules). false = report only.
+        type: boolean
+        default: true
+      shellcheck-enforce:
+        description: Fail the Shell check on shellcheck findings in the tracked *.sh files. false = report only, the findings are in the run summary.
+        type: boolean
+        default: false
       java-version:
         type: string
         default: "21"
@@ -44,6 +60,14 @@ on:
       semgrep-config:
         type: string
         default: p/java p/owasp-top-ten
+      integration-command:
+        description: Shell command that runs the integration tests (TEST-02), run from the repository root after the toolchain is set up and the dependencies are installed; Docker is available for throwaway containers. Empty (default) = no Integration tests job runs.
+        type: string
+        default: ""
+      java-lint-enforce:
+        description: Fail Lint on javac -Xlint:all warnings (compiled with -Werror). false = report only, the warnings are in the run summary.
+        type: boolean
+        default: false
 
 # Least privilege by default; every job below declares what it needs.
 permissions: {}
@@ -392,7 +416,7 @@ jobs:
     needs: [changes]
     if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -410,6 +434,340 @@ jobs:
 
       - name: Compile (lint check)
         run: ./gradlew compileJava --warning-mode all
+
+      - name: Compiler warnings (javac -Xlint:all)
+        env:
+          ENFORCE: ${{ inputs.java-lint-enforce }}
+        run: |
+          set -uo pipefail
+          # javac -Xlint:all through an init script, so no build file of the repository has to change; -Werror only when enforced
+          cat > "$RUNNER_TEMP/xlint.gradle" <<'GRADLE'
+          allprojects {
+              tasks.withType(JavaCompile).configureEach {
+                  options.compilerArgs << '-Xlint:all'
+                  if (System.getenv('XLINT_WERROR') == 'true') { options.compilerArgs << '-Werror' }
+              }
+          }
+          GRADLE
+          export XLINT_WERROR="$ENFORCE"
+          rc=0
+          ./gradlew compileJava --rerun --no-daemon --console=plain --init-script "$RUNNER_TEMP/xlint.gradle" 2>&1 | tee "$RUNNER_TEMP/xlint.log" || rc=${PIPESTATUS[0]}
+          # the distinct warnings, without the workspace prefix (Gradle repeats them in its failure message)
+          grep ': warning: ' "$RUNNER_TEMP/xlint.log" | sed -e 's/^ *//' -e "s#^$PWD/##" | sort -u > "$RUNNER_TEMP/xlint-warnings.txt" || true
+          n=$(wc -l < "$RUNNER_TEMP/xlint-warnings.txt")
+          {
+            echo "### Java lint (javac -Xlint:all)"
+            echo
+            if [ "$rc" != 0 ]; then
+              echo "**Failed** (exit $rc)$([ "$ENFORCE" = true ] && echo ", compiled with -Werror (input \`java-lint-enforce\`)")."
+            elif [ "$n" -gt 0 ]; then
+              echo "**$n warning(s)**, report only (input \`java-lint-enforce\`):"
+            else
+              echo "No warnings."
+            fi
+            if [ "$n" -gt 0 ]; then
+              echo
+              echo '```'
+              head -n 40 "$RUNNER_TEMP/xlint-warnings.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" != 0 ]; then
+            echo "::error::compiling with -Xlint:all failed (exit $rc)"
+            exit 1
+          fi
+          [ "$n" -eq 0 ] || echo "::warning::javac -Xlint:all: $n warning(s). Report only (input java-lint-enforce is false); the list is in the run summary."
+
+  proto:
+    name: "Proto check"
+    needs: [changes]
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Look for proto files
+        id: site
+        env:
+          PROTO_DIR: ${{ inputs.proto-dir }}
+        run: |
+          set -euo pipefail
+          dir=$PROTO_DIR
+          case "$dir" in
+            *[!A-Za-z0-9._/-]* | /* | *..*)
+              echo "::error::input proto-dir must be a relative path of letters, digits, . _ - and /"
+              exit 1
+              ;;
+          esac
+          if [ -n "$dir" ]; then
+            if [ -z "$(git ls-files -- "$dir" | grep '\.proto$' || true)" ]; then
+              echo "::error::input proto-dir is '$dir', which has no tracked .proto file"
+              exit 1
+            fi
+          else
+            for candidate in proto src/main/proto src/protos; do
+              if [ -n "$(git ls-files -- "$candidate" | grep '\.proto$' || true)" ]; then dir=$candidate; break; fi
+            done
+          fi
+          if [ -z "$dir" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            if [ -n "$(git ls-files -- '*.proto' | head -1)" ]; then
+              echo "other=true" >> "$GITHUB_OUTPUT"
+              echo "::warning::.proto files exist outside proto, src/main/proto or src/protos; set the input proto-dir to check them"
+            else
+              echo "no .proto file in this repository: nothing to check"
+            fi
+            exit 0
+          fi
+          echo "present=true" >> "$GITHUB_OUTPUT"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "proto directory: $dir"
+
+      - name: Check out the default branch (to compare against)
+        if: steps.site.outputs.present == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: base
+          persist-credentials: false
+
+      - name: Install buf
+        if: steps.site.outputs.present == 'true'
+        env:
+          BUF_VERSION: "1.75.0"
+          BUF_SHA256: "fad1e38d6909bbb583a4da81d8c02a01046e2cd663bde7e337dd24277393764b"
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/buf" "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-x86_64"
+          echo "${BUF_SHA256}  $RUNNER_TEMP/buf" | sha256sum -c -
+          sudo install -m 0755 "$RUNNER_TEMP/buf" /usr/local/bin/buf
+          buf --version
+
+      - name: Lint the proto files (buf lint)
+        id: lint
+        if: steps.site.outputs.present == 'true'
+        env:
+          PROTO_DIR: ${{ steps.site.outputs.dir }}
+          LINT_CONFIG: '{"version":"v1","lint":{"use":["MINIMAL"],"except":["PACKAGE_DIRECTORY_MATCH"]}}'
+          ENFORCE: ${{ inputs.proto-lint-enforce }}
+        run: |
+          set -uo pipefail
+          rc=0
+          buf lint "$PROTO_DIR" --config "$LINT_CONFIG" > "$RUNNER_TEMP/buf-lint.txt" 2>&1 || rc=$?
+          cat "$RUNNER_TEMP/buf-lint.txt"
+          case "$rc" in
+            0) echo "result=passed" >> "$GITHUB_OUTPUT" ;;
+            100)
+              echo "result=findings" >> "$GITHUB_OUTPUT"
+              n=$(grep -c . "$RUNNER_TEMP/buf-lint.txt" || true)
+              if [ "$ENFORCE" = true ]; then
+                echo "::error::buf lint: $n finding(s)"
+                exit 1
+              fi
+              echo "::warning::buf lint: $n finding(s). Report only (input proto-lint-enforce is false); the list is in the run summary."
+              ;;
+            *)
+              echo "result=error" >> "$GITHUB_OUTPUT"
+              echo "::error::buf lint did not run (exit $rc)"
+              exit 1
+              ;;
+          esac
+
+      - name: Check the contract of the default branch (buf breaking)
+        id: breaking
+        if: ${{ !cancelled() && steps.site.outputs.present == 'true' }}
+        env:
+          PROTO_DIR: ${{ steps.site.outputs.dir }}
+          BREAKING_CONFIG: '{"version":"v1","breaking":{"use":["FILE"]}}'
+          ENFORCE: ${{ inputs.proto-breaking-enforce }}
+        run: |
+          set -uo pipefail
+          base="base/$PROTO_DIR"
+          if [ -z "$(find "$base" -name '*.proto' -print -quit 2>/dev/null)" ]; then
+            echo "result=new" >> "$GITHUB_OUTPUT"
+            echo "the default branch has no .proto file in $PROTO_DIR: nothing to compare against"
+            exit 0
+          fi
+          rc=0
+          buf breaking "$PROTO_DIR" --against "$base" --config "$BREAKING_CONFIG" > "$RUNNER_TEMP/buf-breaking.txt" 2>&1 || rc=$?
+          cat "$RUNNER_TEMP/buf-breaking.txt"
+          case "$rc" in
+            0) echo "result=passed" >> "$GITHUB_OUTPUT" ;;
+            100)
+              echo "result=findings" >> "$GITHUB_OUTPUT"
+              n=$(grep -c . "$RUNNER_TEMP/buf-breaking.txt" || true)
+              if [ "$ENFORCE" = true ]; then
+                echo "::error::buf breaking: $n change(s) break the wire contract of the default branch. Proto changes are additive only (new fields, new RPCs)."
+                exit 1
+              fi
+              echo "::warning::buf breaking: $n change(s) break the wire contract of the default branch. Report only (input proto-breaking-enforce is false)."
+              ;;
+            *)
+              echo "result=error" >> "$GITHUB_OUTPUT"
+              echo "::error::buf breaking did not run (exit $rc)"
+              exit 1
+              ;;
+          esac
+
+      - name: Write the proto summary
+        if: ${{ !cancelled() }}
+        env:
+          PRESENT: ${{ steps.site.outputs.present }}
+          OTHER: ${{ steps.site.outputs.other }}
+          PROTO_DIR: ${{ steps.site.outputs.dir }}
+          LINT: ${{ steps.lint.outputs.result }}
+          BREAKING: ${{ steps.breaking.outputs.result }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -uo pipefail
+          words() {
+            case "$1" in
+              passed) echo passed ;;
+              findings) echo "$2" ;;
+              new) echo "nothing to compare: the default branch has no proto here" ;;
+              error) echo "**did not run**" ;;
+              *) echo "not run" ;;
+            esac
+          }
+          show() { # show <file> <heading>: the findings, at most 40 lines
+            [ -s "$1" ] || return 0
+            echo
+            echo "$2"
+            echo
+            echo '```'
+            head -n 40 "$1"
+            [ "$(wc -l < "$1")" -le 40 ] || echo "... (the log of the step has the rest)"
+            echo '```'
+          }
+          {
+            echo "### Proto check"
+            echo
+            if [ "$PRESENT" != true ]; then
+              echo "This repository has no .proto file in proto, src/main/proto or src/protos, so there is nothing to check."
+              [ "$OTHER" != true ] || echo "It has .proto files elsewhere: set the input \`proto-dir\` to check them."
+            else
+              echo "Directory: \`$PROTO_DIR\`. buf 1.75.0, inline config (the MINIMAL lint rules without PACKAGE_DIRECTORY_MATCH, the FILE breaking rules); a \`buf.yaml\` in the repository is not used."
+              echo
+              echo "| | |"
+              echo "|---|---|"
+              echo "| \`buf lint\` | $(words "$LINT" "findings, report only (input \`proto-lint-enforce\`)") |"
+              echo "| \`buf breaking\` against \`$DEFAULT_BRANCH\` | $(words "$BREAKING" "**breaks the contract of the default branch**") |"
+              [ "$LINT" != findings ] || show "$RUNNER_TEMP/buf-lint.txt" "buf lint:"
+              [ "$BREAKING" != findings ] || show "$RUNNER_TEMP/buf-breaking.txt" "buf breaking:"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  shell:
+    name: "Shell check"
+    needs: [changes]
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Look for shell scripts
+        id: site
+        run: |
+          set -euo pipefail
+          n=$(git ls-files -- '*.sh' | wc -l)
+          if [ "$n" -gt 0 ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "$n shell script(s)"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "no tracked *.sh file in this repository: nothing to check"
+          fi
+
+      - name: Install shellcheck
+        if: steps.site.outputs.present == 'true'
+        env:
+          SHELLCHECK_VERSION: "0.11.0"
+          SHELLCHECK_SHA256: "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/shellcheck.tar.xz" "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  $RUNNER_TEMP/shellcheck.tar.xz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/shellcheck"
+          tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP/shellcheck" --strip-components=1 "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          sudo install -m 0755 "$RUNNER_TEMP/shellcheck/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version | head -2
+
+      - name: Run shellcheck
+        id: shellcheck
+        if: steps.site.outputs.present == 'true'
+        env:
+          ENFORCE: ${{ inputs.shellcheck-enforce }}
+        run: |
+          set -uo pipefail
+          mapfile -d '' files < <(git ls-files -z -- '*.sh')
+          rc=0
+          shellcheck -x --format=gcc -- "${files[@]}" > "$RUNNER_TEMP/shellcheck.txt" 2>&1 || rc=$?
+          cat "$RUNNER_TEMP/shellcheck.txt"
+          case "$rc" in
+            0) echo "result=passed" >> "$GITHUB_OUTPUT" ;;
+            1)
+              echo "result=findings" >> "$GITHUB_OUTPUT"
+              n=$(grep -c . "$RUNNER_TEMP/shellcheck.txt" || true)
+              level=warning
+              [ "$ENFORCE" != true ] || level=error
+              # one annotation per finding on the line it is about (the gcc format: file:line:col: level: message [SCnnnn])
+              while IFS= read -r line; do
+                if [[ "$line" =~ ^(.+):([0-9]+):([0-9]+):\ [a-z]+:\ (.*)$ ]]; then
+                  echo "::$level file=${BASH_REMATCH[1]},line=${BASH_REMATCH[2]},col=${BASH_REMATCH[3]}::${BASH_REMATCH[4]}"
+                fi
+              done < "$RUNNER_TEMP/shellcheck.txt"
+              if [ "$ENFORCE" = true ]; then
+                echo "::error::shellcheck: $n finding(s)"
+                exit 1
+              fi
+              echo "::warning::shellcheck: $n finding(s). Report only (input shellcheck-enforce is false); the list is in the run summary."
+              ;;
+            *)
+              echo "result=error" >> "$GITHUB_OUTPUT"
+              echo "::error::shellcheck did not run cleanly (exit $rc)"
+              exit 1
+              ;;
+          esac
+
+      - name: Write the shell summary
+        if: ${{ !cancelled() }}
+        env:
+          PRESENT: ${{ steps.site.outputs.present }}
+          RESULT: ${{ steps.shellcheck.outputs.result }}
+        run: |
+          set -uo pipefail
+          {
+            echo "### Shell check"
+            echo
+            if [ "$PRESENT" != true ]; then
+              echo "This repository has no tracked \`*.sh\` file, so there is nothing to check."
+            else
+              echo "shellcheck 0.11.0 on every tracked \`*.sh\` file (default severity, \`-x\`)."
+              echo
+              case "$RESULT" in
+                passed) echo "Result: passed." ;;
+                findings)
+                  echo "Result: **findings**, report only (input \`shellcheck-enforce\`):"
+                  echo
+                  echo '```'
+                  head -n 40 "$RUNNER_TEMP/shellcheck.txt"
+                  [ "$(wc -l < "$RUNNER_TEMP/shellcheck.txt")" -le 40 ] || echo "... (the log of the step has the rest)"
+                  echo '```'
+                  ;;
+                *) echo "Result: **did not run**." ;;
+              esac
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: "Build"
@@ -465,6 +823,33 @@ jobs:
         with:
           name: test-results
           path: build/reports/tests/test/
+
+  integration:
+    name: "Integration tests"
+    needs: [changes]
+    if: ${{ needs.changes.outputs.code == 'true' && inputs.integration-command != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: ${{ inputs.java-distribution }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
+
+      - name: Run the integration tests
+        env:
+          COMMAND: ${{ inputs.integration-command }}
+        run: |
+          bash -euo pipefail -c "$COMMAND"
 
   sca:
     name: "Dependency scan"
@@ -764,7 +1149,7 @@ jobs:
 
   gate:
     name: "gate"
-    needs: [changes, secret-scan, workflow-lint, docs, lint, build, test, sca, sast, image]
+    needs: [changes, secret-scan, workflow-lint, docs, lint, proto, shell, build, test, integration, sca, sast, image]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -774,6 +1159,7 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
           IMAGE: ${{ inputs.image }}
+          INTEGRATION: ${{ inputs.integration-command != '' }}
           CODE: ${{ needs.changes.outputs.code }}
           DOCS: ${{ needs.docs.outputs.present }}
           EVENT: ${{ github.event_name }}
@@ -782,8 +1168,8 @@ jobs:
         run: |
           # Jobs this workflow has, in the order of the graph: the three guards, then the checks (generated per language), and their names.
           guards=" changes secret-scan workflow-lint docs "
-          checks=" lint build test sca sast image "
-          declare -A names=([changes]="Detect changes" [secret-scan]="Secret scan" [workflow-lint]="Workflow lint" [docs]="Docs check" [lint]="Lint" [build]="Build" [test]="Tests" [sca]="Dependency scan" [sast]="Code scan" [image]="Image build and scan")
+          checks=" lint proto shell build test integration sca sast image "
+          declare -A names=([changes]="Detect changes" [secret-scan]="Secret scan" [workflow-lint]="Workflow lint" [docs]="Docs check" [lint]="Lint" [proto]="Proto check" [shell]="Shell check" [build]="Build" [test]="Tests" [integration]="Integration tests" [sca]="Dependency scan" [sast]="Code scan" [image]="Image build and scan")
 
           # Text that does not come from this script (an unknown job id, a result) is shown with letters, digits and . _ - only.
           safe() { printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9._-' '?' | cut -c1-60; }
@@ -807,6 +1193,10 @@ jobs:
           case "$IMAGE" in
             true | false) ;;
             *) stop "input image is '$IMAGE', expected true or false" "the input image is neither true nor false" ;;
+          esac
+          case "$INTEGRATION" in
+            true | false) ;;
+            *) stop "integration is '$INTEGRATION', expected true or false" "the integration switch is neither true nor false" ;;
           esac
 
           declare -A result
@@ -837,12 +1227,16 @@ jobs:
             esac
           done
 
-          # 2. What each job should have done. Guards always succeed. Checks succeed when code changed (the image check only if image is on);
-          #    otherwise they are skipped: docs-only change, or image off. Any other result is unexplained.
+          # 2. What each job should have done. Guards always succeed. Checks succeed when code changed (the image check only if image is on, the
+          #    integration tests only if the caller gave integration-command); otherwise they are skipped: docs-only change, image off, integration
+          #    not enabled. Any other result is unexplained.
           declare -A want
           for job in $guards; do want[$job]=success; done
           for job in $checks; do
-            if [ "$CODE" = "true" ] && { [ "$job" != "image" ] || [ "$IMAGE" = "true" ]; }; then want[$job]=success; else want[$job]=skipped; fi
+            on=true
+            if [ "$job" = "image" ] && [ "$IMAGE" != "true" ]; then on=false; fi
+            if [ "$job" = "integration" ] && [ "$INTEGRATION" != "true" ]; then on=false; fi
+            if [ "$CODE" = "true" ] && [ "$on" = "true" ]; then want[$job]=success; else want[$job]=skipped; fi
           done
           if [ "$failed" = 0 ] && [ "$CODE" != "true" ] && [ "$CODE" != "false" ]; then
             echo "::error::change detection gave '$CODE', expected true or false"
@@ -862,7 +1256,9 @@ jobs:
             elif [ "$res" = "$expected" ]; then
               cell=$(words "$res")
               if [ "$res" = skipped ]; then
-                if [ "$CODE" = "false" ]; then cell="skipped: documentation only"; else cell="skipped: no image pipeline"; fi
+                if [ "$CODE" = "false" ]; then cell="skipped: documentation only"
+                elif [ "$job" = "integration" ]; then cell="skipped: not enabled (the input integration-command is empty)"
+                else cell="skipped: no image pipeline"; fi
               fi
               if [ "$job" = docs ] && [ "$res" = success ] && [ "$DOCS" = false ]; then cell="passed: no mkdocs.yml, nothing to check"; fi
             elif [ "$failed" = 1 ]; then
