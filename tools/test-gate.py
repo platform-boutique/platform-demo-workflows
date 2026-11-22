@@ -11,7 +11,7 @@ root = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.pat
 wfdir = os.path.join(root, ".github", "workflows")
 GUARDS = ["changes", "secret-scan", "workflow-lint", "docs"]
 NAME = {"changes": "Detect changes", "secret-scan": "Secret scan", "workflow-lint": "Workflow lint", "docs": "Docs check", "lint": "Lint", "build": "Build",
-        "test": "Tests", "sca": "Dependency scan", "sast": "Code scan", "image": "Image build and scan"}
+        "test": "Tests", "proto": "Proto check", "shell": "Shell check", "integration": "Integration tests", "sca": "Dependency scan", "sast": "Code scan", "image": "Image build and scan"}
 failures, count = [], 0
 
 
@@ -25,11 +25,11 @@ def gate_of(lang):
 PR = {"event": "pull_request", "head": "o/r", "actor": "alice"}
 
 
-def run(script, needs, image, code, event=PR):
+def run(script, needs, image, code, event=PR, integration="false"):
     with tempfile.TemporaryDirectory() as tmp:
         summary = os.path.join(tmp, "summary.md")
         open(summary, "w").close()
-        env = {"PATH": os.environ["PATH"], "NEEDS": json.dumps(needs), "IMAGE": image, "CODE": code, "GITHUB_STEP_SUMMARY": summary,
+        env = {"PATH": os.environ["PATH"], "NEEDS": json.dumps(needs), "IMAGE": image, "INTEGRATION": integration, "CODE": code, "GITHUB_STEP_SUMMARY": summary,
                "DOCS": str((needs.get("docs") or {}).get("outputs", {}).get("present", "")), "EVENT": event["event"], "HEAD_REPO": event["head"], "ACTOR": event["actor"], "GITHUB_REPOSITORY": "o/r"}
         p = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], env=env, capture_output=True, text=True)
         return p.returncode, p.stdout, open(summary).read()
@@ -40,12 +40,12 @@ for lang in ("go", "node", "python", "java", "dotnet", "none"):
     checks = [j for j in all_jobs if j not in GUARDS]
     assert set(GUARDS) <= set(all_jobs)
 
-    def needs(code="true", img=True, **override):
+    def needs(code="true", img=True, integ=False, **override):
         n = {}
         for j in all_jobs:
             if j in GUARDS:
                 n[j] = {"result": "success", "outputs": {"code": code} if j == "changes" else {"present": "true"} if j == "docs" else {}}
-            elif code == "true" and (j != "image" or img):
+            elif code == "true" and (j != "image" or img) and (j != "integration" or integ):
                 n[j] = {"result": "success", "outputs": {}}
             else:
                 n[j] = {"result": "skipped", "outputs": {}}
@@ -53,10 +53,10 @@ for lang in ("go", "node", "python", "java", "dotnet", "none"):
             n[j.replace("_", "-")]["result"] = r
         return n
 
-    def check(name, expect_ok, needs_, image="true", code="true", contains=(), absent=(), event=PR, summary_has=(), summary_lacks=(), starts=None):
+    def check(name, expect_ok, needs_, image="true", code="true", contains=(), absent=(), event=PR, summary_has=(), summary_lacks=(), starts=None, integration="false"):
         global count
         count += 1
-        rc, out, summ = run(script, needs_, image, code, event)
+        rc, out, summ = run(script, needs_, image, code, event, integration)
         text = out + summ
         problems = []
         if (rc == 0) != expect_ok:
@@ -110,6 +110,37 @@ for lang in ("go", "node", "python", "java", "dotnet", "none"):
     n = needs()
     check("step summary has the table", True, n, summary_has=["| Job | Result |", "| Detect changes | passed |", "| Secret scan | passed |"])
 
+    # ---- v3.8.0: the new jobs. proto and shell are plain checks (success when code changed); integration only when the input is set ----
+    for new in ("proto", "shell"):
+        check(f"{new} check failed", False, needs(**{new: "failure"}), contains=[f"{new} failure"], starts=f"### Blocked: {NAME[new]} failed\n")
+        check(f"{new} check skipped without a reason", False, needs(**{new: "skipped"}), contains=[f"{new} is 'skipped', expected 'success'"])
+        check(f"{new} check was cancelled", False, needs(**{new: "cancelled"}), contains=[f"{new} cancelled"])
+        check(f"{new} check is skipped for a documentation-only change", True, needs(code="false"), code="false", summary_has=[f"| {NAME[new]} | skipped: documentation only |"])
+        check(f"{new} check ran for a documentation-only change", False, needs(code="false", **{new: "success"}), code="false", contains=[f"{new} is 'success', expected 'skipped'"])
+        m = needs()
+        del m[new]
+        check(f"{new} check is missing from needs", False, m, contains=[f"{new} is missing from needs"])
+    if "integration" in all_jobs:
+        check("integration off (default): the job is skipped and that is fine", True, needs(), summary_has=["| Integration tests | skipped: not enabled (the input integration-command is empty) |"],
+              summary_lacks=["expected"])
+        check("integration off: it must not run", False, needs(integration="success"), contains=["integration is 'success', expected 'skipped'"])
+        check("integration on: green", True, needs(integ=True), integration="true", summary_has=["| Integration tests | passed |"], summary_lacks=["not enabled"])
+        check("integration on: failed is the cause", False, needs(integ=True, integration="failure"), integration="true",
+              contains=["integration failure"], starts="### Blocked: Integration tests failed\n", summary_has=["| Integration tests | failed |"])
+        check("integration on: cancelled", False, needs(integ=True, integration="cancelled"), integration="true", contains=["integration cancelled"])
+        check("integration on but the job was skipped: unexplained", False, needs(integ=True, integration="skipped"), integration="true",
+              contains=["integration is 'skipped', expected 'success'"], starts="### Blocked: Integration tests ended as skipped, which was not expected\n")
+        check("integration on, docs-only change: skipped for the documentation", True, needs(code="false", integ=True), code="false", integration="true",
+              summary_has=["| Integration tests | skipped: documentation only |"])
+        check("integration on, image off: both behave", True, needs(img=False, integ=True), image="false", integration="true",
+              summary_has=["| Integration tests | passed |", "| Image build and scan | skipped: no image pipeline |"])
+        check("integration on, a different check failed: only that one is the cause", False, needs(integ=True, **{victim: "failure"}), integration="true",
+              contains=[f"{victim} failure"], absent=["integration is"])
+        check("the integration switch is neither true nor false", False, needs(), integration="maybe", contains=["integration is 'maybe'"],
+              starts="### Blocked: the integration switch is neither true nor false")
+    else:
+        check("a file without an integration job: a job nobody told the gate about", False, {**needs(), "integration": {"result": "success", "outputs": {}}}, contains=["(unknown job)"])
+
     # ---- the run summary: the verdict first, plain names, what the Merge button will do ----
     vname = NAME[victim]
     check("summary: green pull request", True, needs(), starts="### Ready to merge\n",
@@ -131,7 +162,7 @@ for lang in ("go", "node", "python", "java", "dotnet", "none"):
     check("summary: a cancelled check", False, needs(**{victim: "cancelled"}), starts=f"### Blocked: {vname} cancelled\n")
     check("summary: a failed guard is named, its skipped checks are only 'skipped'", False,
           {**needs(secret_scan="failure"), **{j: {"result": "skipped", "outputs": {}} for j in checks}},
-          starts="### Blocked: Secret scan failed\n", summary_has=["| Secret scan | failed |"] + [f"| {NAME[j]} | skipped |" for j in checks],
+          starts="### Blocked: Secret scan failed\n", summary_has=["| Secret scan | failed |"] + [f"| {NAME[j]} | skipped |" for j in checks if j != "integration"] + (["| Integration tests | skipped: not enabled"] if "integration" in checks else []),
           summary_lacks=["expected"])
     n2 = needs(secret_scan="failure", **{victim: "failure"})
     check("summary: two failures name the first in graph order and count the others", False, n2,

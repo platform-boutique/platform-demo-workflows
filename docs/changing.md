@@ -14,3 +14,5 @@ Tools (all need the GitHub CLI logged in): `tools/bump-actions.py` (move every p
 `--hold gradle/actions=v5`), `tools/gen-lang-workflows.py`, `tools/gen-callers.py`, `tools/gen-guardrails.py` (CODEOWNERS,
 Dependabot, `.pre-commit-config.yaml` for a repo), `tools/transfer-repo.sh` (move a repo to the org and re-apply what a transfer resets), `tools/required-checks.sh` + `tools/protect-repo.sh` (branch protection with the
 required checks taken from a repo's last green PR, squash-only merges, secret scanning, tag ruleset).
+
+Pinned downloads (gitleaks, buf, shellcheck) are written in `tools/gen-lang-workflows.py` / `tools/gen-service-ci.py` with their sha256: bump the version and the checksum together (buf: the release's `sha256.txt`; shellcheck: the asset `digest` of `gh api repos/koalaman/shellcheck/releases/tags/<tag>`), regenerate, and run `tools/test-generators.py` with `buf` and `shellcheck` on PATH so the generated Proto and Shell steps run against throw-away repositories.

@@ -41,7 +41,18 @@ jobs:
       - name: Gate scenarios
         run: python3 tools/test-gate.py
 
-      # the generators of the app repositories' files: Dependabot's multi-ecosystem rules, publish on/off, the new services
+      # tools/test-generators.py also RUNS the Proto check and Shell check steps of service-ci-* against throw-away git repositories when buf and
+      # shellcheck are on PATH: buf at the version and sha256 the generated workflows use (shellcheck is on the runner image)
+      - name: Install buf (for the proto step scenarios)
+        env:
+          BUF_VERSION: "1.75.0"
+          BUF_SHA256: "fad1e38d6909bbb583a4da81d8c02a01046e2cd663bde7e337dd24277393764b"
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/buf" "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-x86_64"
+          echo "${BUF_SHA256}  $RUNNER_TEMP/buf" | sha256sum -c -
+          sudo install -m 0755 "$RUNNER_TEMP/buf" /usr/local/bin/buf
+
+      # the generators of the app repositories' files: Dependabot's multi-ecosystem rules, publish on/off, the new services; the new jobs of service-ci-*
       - name: Generator scenarios
         run: python3 tools/test-generators.py
 

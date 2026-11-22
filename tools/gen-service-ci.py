@@ -92,11 +92,14 @@ GUARDS = ["changes", "secret-scan", "workflow-lint", "docs"]
 # Language detail belongs in the step names. The same names in all six files (tools/check-consistency.py pins them).
 NAMES = {
     "changes": "Detect changes", "secret-scan": "Secret scan", "workflow-lint": "Workflow lint", "docs": "Docs check",
-    "lint": "Lint", "build": "Build", "test": "Tests",
+    "lint": "Lint", "proto": "Proto check", "shell": "Shell check", "build": "Build", "test": "Tests", "integration": "Integration tests",
     "sca": "Dependency scan", "sast": "Code scan", "image": "Image build and scan", "gate": "gate",
 }
-CHECKS = {l: ["lint", "build", "test", "sca", "sast", "image"] for l in LANGS if l != "none"}
-CHECKS["none"] = ["image"]
+# v3.8.0: `proto` (buf) and `shell` (shellcheck) are in every file and end green with "nothing to check" when the repository has no
+# such files; `integration` (TEST-02) exists in the five language files and is SKIPPED unless the caller sets `integration-command`.
+CHECKS = {l: ["lint", "proto", "shell", "build", "test", "integration", "sca", "sast", "image"] for l in LANGS if l != "none"}
+CHECKS["none"] = ["proto", "shell", "image"]
+OPTIONAL = {"integration"}  # checks that run only when a caller input turns them on; the gate expects "skipped" otherwise
 
 
 # ───────────────────────── reading the stand-alone workflows (tools/wfgen.py) ─────────────────────────
@@ -225,8 +228,401 @@ words() { case "$1" in success) echo passed ;; failure) echo "**failed**" ;; ski
 """
 
 
+# ───────────────────────── v3.8.0: proto check, shell check, integration tests, Java compiler warnings ─────────────────────────
+#
+# Rule of this block: nothing here may turn an existing repository's pull request red with the default inputs. A check that is
+# clean on every app repository today FAILS the run (buf breaking: a pull request that breaks the wire contract of the default
+# branch). A check that has findings on existing code (buf lint with the MINIMAL rules, shellcheck, javac -Xlint:all) is REPORT ONLY:
+# the step ends green, writes `::warning::` annotations and the run summary lists the findings, and an input (`*-enforce`) turns
+# it into a failure once the code is clean. The integration job runs only when the caller passes `integration-command`.
+# Tool versions are pinned here and verified by sha256 (no workflow input: bumped by hand in this one place; Dependabot does not
+# read a download URL in a script).
+BUF_VERSION = "1.75.0"
+BUF_SHA256 = "fad1e38d6909bbb583a4da81d8c02a01046e2cd663bde7e337dd24277393764b"  # buf-Linux-x86_64 of the release (sha256.txt)
+# `hipstershop` (the legacy package of every service) does not match its directory, and the health proto sits next to the service
+# proto: inline MINIMAL without PACKAGE_DIRECTORY_MATCH. v1 inline config: it makes the directory given to buf the module root
+# (a v2 inline config makes the repository root the module and then refuses `proto/` as the input).
+BUF_LINT_CONFIG = '{"version":"v1","lint":{"use":["MINIMAL"],"except":["PACKAGE_DIRECTORY_MATCH"]}}'
+BUF_BREAKING_CONFIG = '{"version":"v1","breaking":{"use":["FILE"]}}'
+SHELLCHECK_VERSION = "0.11.0"
+SHELLCHECK_SHA256 = "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"  # shellcheck-v0.11.0.linux.x86_64.tar.xz (GitHub's digest)
+PROTO_DIRS = ["proto", "src/main/proto", "src/protos"]  # looked at in this order when `proto-dir` is empty
+
+# the inputs of all six files (identical text: tools/check-consistency.py pins them)
+NEW_COMMON_INPUTS = """\
+      proto-dir:
+        description: Directory with the .proto files (the buf module root). Empty looks for proto, src/main/proto and src/protos; a repository without any skips the Proto check.
+        type: string
+        default: ""
+      proto-lint-enforce:
+        description: Fail the Proto check on buf lint findings (MINIMAL rules without PACKAGE_DIRECTORY_MATCH). false = report only, the findings are in the run summary.
+        type: boolean
+        default: false
+      proto-breaking-enforce:
+        description: Fail the Proto check when the pull request breaks the wire contract of the default branch (buf breaking, FILE rules). false = report only.
+        type: boolean
+        default: true
+      shellcheck-enforce:
+        description: Fail the Shell check on shellcheck findings in the tracked *.sh files. false = report only, the findings are in the run summary.
+        type: boolean
+        default: false
+"""
+# the five language files
+INTEGRATION_INPUT = """\
+      integration-command:
+        description: Shell command that runs the integration tests (TEST-02), run from the repository root after the toolchain is set up and the dependencies are installed; Docker is available for throwaway containers. Empty (default) = no Integration tests job runs.
+        type: string
+        default: ""
+"""
+JAVA_LINT_INPUT = """\
+      java-lint-enforce:
+        description: Fail Lint on javac -Xlint:all warnings (compiled with -Werror). false = report only, the warnings are in the run summary.
+        type: boolean
+        default: false
+"""
+
+PROTO_SITE_SCRIPT = r"""
+set -euo pipefail
+dir=$PROTO_DIR
+case "$dir" in
+  *[!A-Za-z0-9._/-]* | /* | *..*)
+    echo "::error::input proto-dir must be a relative path of letters, digits, . _ - and /"
+    exit 1
+    ;;
+esac
+if [ -n "$dir" ]; then
+  if [ -z "$(git ls-files -- "$dir" | grep '\.proto$' || true)" ]; then
+    echo "::error::input proto-dir is '$dir', which has no tracked .proto file"
+    exit 1
+  fi
+else
+  for candidate in __DIRS__; do
+    if [ -n "$(git ls-files -- "$candidate" | grep '\.proto$' || true)" ]; then dir=$candidate; break; fi
+  done
+fi
+if [ -z "$dir" ]; then
+  echo "present=false" >> "$GITHUB_OUTPUT"
+  if [ -n "$(git ls-files -- '*.proto' | head -1)" ]; then
+    echo "other=true" >> "$GITHUB_OUTPUT"
+    echo "::warning::.proto files exist outside __DIRS_TEXT__; set the input proto-dir to check them"
+  else
+    echo "no .proto file in this repository: nothing to check"
+  fi
+  exit 0
+fi
+echo "present=true" >> "$GITHUB_OUTPUT"
+echo "dir=$dir" >> "$GITHUB_OUTPUT"
+echo "proto directory: $dir"
+"""
+
+BUF_INSTALL_SCRIPT = r"""
+set -euo pipefail
+curl -fsSL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/buf" "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-x86_64"
+echo "${BUF_SHA256}  $RUNNER_TEMP/buf" | sha256sum -c -
+sudo install -m 0755 "$RUNNER_TEMP/buf" /usr/local/bin/buf
+buf --version
+"""
+
+BUF_LINT_SCRIPT = r"""
+set -uo pipefail
+rc=0
+buf lint "$PROTO_DIR" --config "$LINT_CONFIG" > "$RUNNER_TEMP/buf-lint.txt" 2>&1 || rc=$?
+cat "$RUNNER_TEMP/buf-lint.txt"
+case "$rc" in
+  0) echo "result=passed" >> "$GITHUB_OUTPUT" ;;
+  100)
+    echo "result=findings" >> "$GITHUB_OUTPUT"
+    n=$(grep -c . "$RUNNER_TEMP/buf-lint.txt" || true)
+    if [ "$ENFORCE" = true ]; then
+      echo "::error::buf lint: $n finding(s)"
+      exit 1
+    fi
+    echo "::warning::buf lint: $n finding(s). Report only (input proto-lint-enforce is false); the list is in the run summary."
+    ;;
+  *)
+    echo "result=error" >> "$GITHUB_OUTPUT"
+    echo "::error::buf lint did not run (exit $rc)"
+    exit 1
+    ;;
+esac
+"""
+
+BUF_BREAKING_SCRIPT = r"""
+set -uo pipefail
+base="base/$PROTO_DIR"
+if [ -z "$(find "$base" -name '*.proto' -print -quit 2>/dev/null)" ]; then
+  echo "result=new" >> "$GITHUB_OUTPUT"
+  echo "the default branch has no .proto file in $PROTO_DIR: nothing to compare against"
+  exit 0
+fi
+rc=0
+buf breaking "$PROTO_DIR" --against "$base" --config "$BREAKING_CONFIG" > "$RUNNER_TEMP/buf-breaking.txt" 2>&1 || rc=$?
+cat "$RUNNER_TEMP/buf-breaking.txt"
+case "$rc" in
+  0) echo "result=passed" >> "$GITHUB_OUTPUT" ;;
+  100)
+    echo "result=findings" >> "$GITHUB_OUTPUT"
+    n=$(grep -c . "$RUNNER_TEMP/buf-breaking.txt" || true)
+    if [ "$ENFORCE" = true ]; then
+      echo "::error::buf breaking: $n change(s) break the wire contract of the default branch. Proto changes are additive only (new fields, new RPCs)."
+      exit 1
+    fi
+    echo "::warning::buf breaking: $n change(s) break the wire contract of the default branch. Report only (input proto-breaking-enforce is false)."
+    ;;
+  *)
+    echo "result=error" >> "$GITHUB_OUTPUT"
+    echo "::error::buf breaking did not run (exit $rc)"
+    exit 1
+    ;;
+esac
+"""
+
+PROTO_SUMMARY_SCRIPT = r"""
+set -uo pipefail
+words() {
+  case "$1" in
+    passed) echo passed ;;
+    findings) echo "$2" ;;
+    new) echo "nothing to compare: the default branch has no proto here" ;;
+    error) echo "**did not run**" ;;
+    *) echo "not run" ;;
+  esac
+}
+show() { # show <file> <heading>: the findings, at most 40 lines
+  [ -s "$1" ] || return 0
+  echo
+  echo "$2"
+  echo
+  echo '```'
+  head -n 40 "$1"
+  [ "$(wc -l < "$1")" -le 40 ] || echo "... (the log of the step has the rest)"
+  echo '```'
+}
+{
+  echo "### Proto check"
+  echo
+  if [ "$PRESENT" != true ]; then
+    echo "This repository has no .proto file in proto, src/main/proto or src/protos, so there is nothing to check."
+    [ "$OTHER" != true ] || echo "It has .proto files elsewhere: set the input \`proto-dir\` to check them."
+  else
+    echo "Directory: \`$PROTO_DIR\`. buf __BUF_VERSION__, inline config (the MINIMAL lint rules without PACKAGE_DIRECTORY_MATCH, the FILE breaking rules); a \`buf.yaml\` in the repository is not used."
+    echo
+    echo "| | |"
+    echo "|---|---|"
+    echo "| \`buf lint\` | $(words "$LINT" "findings, report only (input \`proto-lint-enforce\`)") |"
+    echo "| \`buf breaking\` against \`$DEFAULT_BRANCH\` | $(words "$BREAKING" "**breaks the contract of the default branch**") |"
+    [ "$LINT" != findings ] || show "$RUNNER_TEMP/buf-lint.txt" "buf lint:"
+    [ "$BREAKING" != findings ] || show "$RUNNER_TEMP/buf-breaking.txt" "buf breaking:"
+  fi
+} >> "$GITHUB_STEP_SUMMARY"
+"""
+
+SHELL_SITE_SCRIPT = r"""
+set -euo pipefail
+n=$(git ls-files -- '*.sh' | wc -l)
+if [ "$n" -gt 0 ]; then
+  echo "present=true" >> "$GITHUB_OUTPUT"
+  echo "$n shell script(s)"
+else
+  echo "present=false" >> "$GITHUB_OUTPUT"
+  echo "no tracked *.sh file in this repository: nothing to check"
+fi
+"""
+
+SHELLCHECK_INSTALL_SCRIPT = r"""
+set -euo pipefail
+curl -fsSL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/shellcheck.tar.xz" "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+echo "${SHELLCHECK_SHA256}  $RUNNER_TEMP/shellcheck.tar.xz" | sha256sum -c -
+mkdir "$RUNNER_TEMP/shellcheck"
+tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP/shellcheck" --strip-components=1 "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+sudo install -m 0755 "$RUNNER_TEMP/shellcheck/shellcheck" /usr/local/bin/shellcheck
+shellcheck --version | head -2
+"""
+
+SHELLCHECK_RUN_SCRIPT = r"""
+set -uo pipefail
+mapfile -d '' files < <(git ls-files -z -- '*.sh')
+rc=0
+shellcheck -x --format=gcc -- "${files[@]}" > "$RUNNER_TEMP/shellcheck.txt" 2>&1 || rc=$?
+cat "$RUNNER_TEMP/shellcheck.txt"
+case "$rc" in
+  0) echo "result=passed" >> "$GITHUB_OUTPUT" ;;
+  1)
+    echo "result=findings" >> "$GITHUB_OUTPUT"
+    n=$(grep -c . "$RUNNER_TEMP/shellcheck.txt" || true)
+    level=warning
+    [ "$ENFORCE" != true ] || level=error
+    # one annotation per finding on the line it is about (the gcc format: file:line:col: level: message [SCnnnn])
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^(.+):([0-9]+):([0-9]+):\ [a-z]+:\ (.*)$ ]]; then
+        echo "::$level file=${BASH_REMATCH[1]},line=${BASH_REMATCH[2]},col=${BASH_REMATCH[3]}::${BASH_REMATCH[4]}"
+      fi
+    done < "$RUNNER_TEMP/shellcheck.txt"
+    if [ "$ENFORCE" = true ]; then
+      echo "::error::shellcheck: $n finding(s)"
+      exit 1
+    fi
+    echo "::warning::shellcheck: $n finding(s). Report only (input shellcheck-enforce is false); the list is in the run summary."
+    ;;
+  *)
+    echo "result=error" >> "$GITHUB_OUTPUT"
+    echo "::error::shellcheck did not run cleanly (exit $rc)"
+    exit 1
+    ;;
+esac
+"""
+
+SHELL_SUMMARY_SCRIPT = r"""
+set -uo pipefail
+{
+  echo "### Shell check"
+  echo
+  if [ "$PRESENT" != true ]; then
+    echo "This repository has no tracked \`*.sh\` file, so there is nothing to check."
+  else
+    echo "shellcheck __SHELLCHECK_VERSION__ on every tracked \`*.sh\` file (default severity, \`-x\`)."
+    echo
+    case "$RESULT" in
+      passed) echo "Result: passed." ;;
+      findings)
+        echo "Result: **findings**, report only (input \`shellcheck-enforce\`):"
+        echo
+        echo '```'
+        head -n 40 "$RUNNER_TEMP/shellcheck.txt"
+        [ "$(wc -l < "$RUNNER_TEMP/shellcheck.txt")" -le 40 ] || echo "... (the log of the step has the rest)"
+        echo '```'
+        ;;
+      *) echo "Result: **did not run**." ;;
+    esac
+  fi
+} >> "$GITHUB_STEP_SUMMARY"
+"""
+
+JAVA_XLINT_SCRIPT = r"""
+set -uo pipefail
+# javac -Xlint:all through an init script, so no build file of the repository has to change; -Werror only when enforced
+cat > "$RUNNER_TEMP/xlint.gradle" <<'GRADLE'
+allprojects {
+    tasks.withType(JavaCompile).configureEach {
+        options.compilerArgs << '-Xlint:all'
+        if (System.getenv('XLINT_WERROR') == 'true') { options.compilerArgs << '-Werror' }
+    }
+}
+GRADLE
+export XLINT_WERROR="$ENFORCE"
+rc=0
+./gradlew compileJava --rerun --no-daemon --console=plain --init-script "$RUNNER_TEMP/xlint.gradle" 2>&1 | tee "$RUNNER_TEMP/xlint.log" || rc=${PIPESTATUS[0]}
+# the distinct warnings, without the workspace prefix (Gradle repeats them in its failure message)
+grep ': warning: ' "$RUNNER_TEMP/xlint.log" | sed -e 's/^ *//' -e "s#^$PWD/##" | sort -u > "$RUNNER_TEMP/xlint-warnings.txt" || true
+n=$(wc -l < "$RUNNER_TEMP/xlint-warnings.txt")
+{
+  echo "### Java lint (javac -Xlint:all)"
+  echo
+  if [ "$rc" != 0 ]; then
+    echo "**Failed** (exit $rc)$([ "$ENFORCE" = true ] && echo ", compiled with -Werror (input \`java-lint-enforce\`)")."
+  elif [ "$n" -gt 0 ]; then
+    echo "**$n warning(s)**, report only (input \`java-lint-enforce\`):"
+  else
+    echo "No warnings."
+  fi
+  if [ "$n" -gt 0 ]; then
+    echo
+    echo '```'
+    head -n 40 "$RUNNER_TEMP/xlint-warnings.txt"
+    echo '```'
+  fi
+} >> "$GITHUB_STEP_SUMMARY"
+if [ "$rc" != 0 ]; then
+  echo "::error::compiling with -Xlint:all failed (exit $rc)"
+  exit 1
+fi
+[ "$n" -eq 0 ] || echo "::warning::javac -Xlint:all: $n warning(s). Report only (input java-lint-enforce is false); the list is in the run summary."
+"""
+
+
+def env_block(pairs):
+    return "        env:\n" + "".join(f"          {k}: {v}\n" for k, v in pairs)
+
+
+def proto_job():
+    present = "steps.site.outputs.present == 'true'"
+    steps = [
+        wfgen.checkout_step(),
+        ("      - name: Look for proto files\n"
+         "        id: site\n" + env_block([("PROTO_DIR", "${{ inputs.proto-dir }}")]) +
+         "        run: |\n" + wfgen.script(PROTO_SITE_SCRIPT.replace("__DIRS__", " ".join(PROTO_DIRS)).replace("__DIRS_TEXT__", ", ".join(PROTO_DIRS[:-1]) + " or " + PROTO_DIRS[-1]))),
+        (f"      - name: Check out the default branch (to compare against)\n"
+         f"        if: {present}\n"
+         f"        uses: {wfgen.pin('actions/checkout')}\n"
+         "        with:\n"
+         "          ref: ${{ github.event.repository.default_branch }}\n"
+         "          path: base\n"
+         "          persist-credentials: false"),
+        ("      - name: Install buf\n"
+         f"        if: {present}\n" + env_block([("BUF_VERSION", f'"{BUF_VERSION}"'), ("BUF_SHA256", f'"{BUF_SHA256}"')]) +
+         "        run: |\n" + wfgen.script(BUF_INSTALL_SCRIPT)),
+        ("      - name: Lint the proto files (buf lint)\n"
+         "        id: lint\n"
+         f"        if: {present}\n" +
+         env_block([("PROTO_DIR", "${{ steps.site.outputs.dir }}"), ("LINT_CONFIG", f"'{BUF_LINT_CONFIG}'"),
+                    ("ENFORCE", "${{ inputs.proto-lint-enforce }}")]) +
+         "        run: |\n" + wfgen.script(BUF_LINT_SCRIPT)),
+        # runs after a failed lint too: both findings in one run
+        ("      - name: Check the contract of the default branch (buf breaking)\n"
+         "        id: breaking\n"
+         f"        if: ${{{{ !cancelled() && {present} }}}}\n" +
+         env_block([("PROTO_DIR", "${{ steps.site.outputs.dir }}"), ("BREAKING_CONFIG", f"'{BUF_BREAKING_CONFIG}'"),
+                    ("ENFORCE", "${{ inputs.proto-breaking-enforce }}")]) +
+         "        run: |\n" + wfgen.script(BUF_BREAKING_SCRIPT)),
+        ("      - name: Write the proto summary\n"
+         "        if: ${{ !cancelled() }}\n" +
+         env_block([("PRESENT", "${{ steps.site.outputs.present }}"), ("OTHER", "${{ steps.site.outputs.other }}"),
+                    ("PROTO_DIR", "${{ steps.site.outputs.dir }}"), ("LINT", "${{ steps.lint.outputs.result }}"),
+                    ("BREAKING", "${{ steps.breaking.outputs.result }}"), ("DEFAULT_BRANCH", "${{ github.event.repository.default_branch }}")]) +
+         "        run: |\n" + wfgen.script(PROTO_SUMMARY_SCRIPT.replace("__BUF_VERSION__", BUF_VERSION))),
+    ]
+    return render_job("proto", steps, timeout=10, perms="    permissions:\n      contents: read", needs=STAGE2_NEEDS, cond=STAGE2_IF)
+
+
+def shell_job():
+    present = "steps.site.outputs.present == 'true'"
+    steps = [
+        wfgen.checkout_step(),
+        ("      - name: Look for shell scripts\n"
+         "        id: site\n"
+         "        run: |\n" + wfgen.script(SHELL_SITE_SCRIPT)),
+        ("      - name: Install shellcheck\n"
+         f"        if: {present}\n" + env_block([("SHELLCHECK_VERSION", f'"{SHELLCHECK_VERSION}"'), ("SHELLCHECK_SHA256", f'"{SHELLCHECK_SHA256}"')]) +
+         "        run: |\n" + wfgen.script(SHELLCHECK_INSTALL_SCRIPT)),
+        ("      - name: Run shellcheck\n"
+         "        id: shellcheck\n"
+         f"        if: {present}\n" + env_block([("ENFORCE", "${{ inputs.shellcheck-enforce }}")]) +
+         "        run: |\n" + wfgen.script(SHELLCHECK_RUN_SCRIPT)),
+        ("      - name: Write the shell summary\n"
+         "        if: ${{ !cancelled() }}\n" +
+         env_block([("PRESENT", "${{ steps.site.outputs.present }}"), ("RESULT", "${{ steps.shellcheck.outputs.result }}")]) +
+         "        run: |\n" + wfgen.script(SHELL_SUMMARY_SCRIPT.replace("__SHELLCHECK_VERSION__", SHELLCHECK_VERSION))),
+    ]
+    return render_job("shell", steps, timeout=10, perms="    permissions:\n      contents: read", needs=STAGE2_NEEDS, cond=STAGE2_IF)
+
+
+def integration_job(lang):
+    """TEST-02: the setup steps of the Tests job (checkout, toolchain, dependencies), then the caller's command. Only when the caller
+    sets `integration-command`; the gate expects `skipped` otherwise."""
+    tests = Job(SOURCE[lang], "unit-tests")
+    names = [s.split("\n")[0] for s in tests.steps]
+    cut = names.index("      - name: Run unit tests")
+    setup = tests.steps[:cut]
+    assert len(setup) >= 3, f"{tests.src}: the steps before 'Run unit tests' changed: {names}"
+    steps = setup + [
+        "      - name: Run the integration tests\n" + env_block([("COMMAND", "${{ inputs.integration-command }}")]) +
+        "        run: |\n" + wfgen.script('bash -euo pipefail -c "$COMMAND"')]
+    return render_job("integration", steps, timeout=30, perms="    permissions:\n      contents: read", needs=STAGE2_NEEDS,
+                      cond="${{ needs.changes.outputs.code == 'true' && inputs.integration-command != '' }}")
+
+
 def lang_jobs(lang):
-    """Lint, Build, Tests, SCA, SAST of one language, from its stand-alone workflow."""
+    """Lint, Build, Tests, SCA, SAST of one language, from its stand-alone workflow, and the optional Integration tests job (dict by job id)."""
     fname = SOURCE[lang]
     tools = tool_defaults(lang)
     lint, build, tests = Job(fname, "lint-format"), Job(fname, "build-check"), Job(fname, "unit-tests")
@@ -268,13 +664,19 @@ def lang_jobs(lang):
     jobs = {"lint": lint, "build": build, "test": tests, "sca": sca, "sast": sast}
     steps = {"lint": lint.steps, "build": b_steps, "test": t_steps, "sca": sca.steps, "sast": sast.steps}
     timeouts = {"lint": lint.timeout(), "build": b_timeout, "test": t_timeout, "sca": sca.timeout(), "sast": sast.timeout()}
-    out = []
+    if lang == "java":  # v3.8.0: javac -Xlint:all, report only unless java-lint-enforce (ad-service has 6 warnings today)
+        steps["lint"] = steps["lint"] + [
+            "      - name: Compiler warnings (javac -Xlint:all)\n" + env_block([("ENFORCE", "${{ inputs.java-lint-enforce }}")]) +
+            "        run: |\n" + wfgen.script(JAVA_XLINT_SCRIPT)]
+        timeouts["lint"] += 5
+    out = {}
     for key in ("lint", "build", "test", "sca", "sast"):
         text = steps[key]
         for name, default in tools.items():  # tool versions: the stand-alone default, written in
             text = [s.replace("${{ inputs." + name + " }}", default) for s in text]
-        out.append(render_job(key, text, timeout=timeouts[key], perms=jobs[key].raw("permissions"),
-                              needs=STAGE2_NEEDS, cond=STAGE2_IF))
+        out[key] = render_job(key, text, timeout=timeouts[key], perms=jobs[key].raw("permissions"),
+                              needs=STAGE2_NEEDS, cond=STAGE2_IF)
+    out["integration"] = integration_job(lang)
     return out
 
 
@@ -337,6 +739,10 @@ case "$IMAGE" in
   true | false) ;;
   *) stop "input image is '$IMAGE', expected true or false" "the input image is neither true nor false" ;;
 esac
+case "$INTEGRATION" in
+  true | false) ;;
+  *) stop "integration is '$INTEGRATION', expected true or false" "the integration switch is neither true nor false" ;;
+esac
 
 declare -A result
 unknown=()
@@ -366,12 +772,16 @@ for job in $guards $checks "${unknown[@]}"; do
   esac
 done
 
-# 2. What each job should have done. Guards always succeed. Checks succeed when code changed (the image check only if image is on);
-#    otherwise they are skipped: docs-only change, or image off. Any other result is unexplained.
+# 2. What each job should have done. Guards always succeed. Checks succeed when code changed (the image check only if image is on, the
+#    integration tests only if the caller gave integration-command); otherwise they are skipped: docs-only change, image off, integration
+#    not enabled. Any other result is unexplained.
 declare -A want
 for job in $guards; do want[$job]=success; done
 for job in $checks; do
-  if [ "$CODE" = "true" ] && { [ "$job" != "image" ] || [ "$IMAGE" = "true" ]; }; then want[$job]=success; else want[$job]=skipped; fi
+  on=true
+  if [ "$job" = "image" ] && [ "$IMAGE" != "true" ]; then on=false; fi
+  if [ "$job" = "integration" ] && [ "$INTEGRATION" != "true" ]; then on=false; fi
+  if [ "$CODE" = "true" ] && [ "$on" = "true" ]; then want[$job]=success; else want[$job]=skipped; fi
 done
 if [ "$failed" = 0 ] && [ "$CODE" != "true" ] && [ "$CODE" != "false" ]; then
   echo "::error::change detection gave '$CODE', expected true or false"
@@ -391,7 +801,9 @@ for job in $guards $checks "${unknown[@]}"; do
   elif [ "$res" = "$expected" ]; then
     cell=$(words "$res")
     if [ "$res" = skipped ]; then
-      if [ "$CODE" = "false" ]; then cell="skipped: documentation only"; else cell="skipped: no image pipeline"; fi
+      if [ "$CODE" = "false" ]; then cell="skipped: documentation only"
+      elif [ "$job" = "integration" ]; then cell="skipped: not enabled (the input integration-command is empty)"
+      else cell="skipped: no image pipeline"; fi
     fi
     if [ "$job" = docs ] && [ "$res" = success ] && [ "$DOCS" = false ]; then cell="passed: no mkdocs.yml, nothing to check"; fi
   elif [ "$failed" = 1 ]; then
@@ -462,11 +874,14 @@ def gate_job(lang):
               .replace("__NAMES__", names))
     body = "\n".join(("          " + l) if l else "" for l in script.strip("\n").split("\n"))
     needs = GUARDS + CHECKS[lang]
+    # the integration job exists in the five language files; its switch is the input, true when a command was given
+    integration = "${{ inputs.integration-command != '' }}" if "integration" in CHECKS[lang] else "false"
     step = (
         "      - name: Every job passed, or was skipped for a reason we know\n"
         "        env:\n"
         "          NEEDS: ${{ toJSON(needs) }}\n"
         "          IMAGE: ${{ inputs.image }}\n"
+        f"          INTEGRATION: {integration}\n"
         "          CODE: ${{ needs.changes.outputs.code }}\n"
         "          DOCS: ${{ needs.docs.outputs.present }}\n"
         "          EVENT: ${{ github.event_name }}\n"
@@ -488,7 +903,7 @@ def inputs_block(lang):
                 if iname == n and old in block:
                     block = block.replace(old, new)
             text += block
-    return COMMON_INPUTS + text
+    return COMMON_INPUTS + NEW_COMMON_INPUTS + text + (INTEGRATION_INPUT if lang != "none" else "") + (JAVA_LINT_INPUT if lang == "java" else "")
 
 
 HEADER = """\
@@ -536,7 +951,9 @@ def render(lang):
                  "# The optional smoke test (input smoke-port) is a step of Build: no extra job, and it reuses the build.\n")
     grant = "contents: read and packages: write (the image job pushes the tree image)" + (" and checks: write (the test reporter)" if lang == "dotnet" else "")
     head = HEADER.format(title=TITLE[lang], who=who, s1=s1, s2=s2, notes=notes, file=file, grant=grant, inputs=inputs_block(lang))
-    jobs = guard_jobs() + [docs_job()] + (lang_jobs(lang) if lang != "none" else []) + [image_job(), gate_job(lang)]
+    lj = lang_jobs(lang) if lang != "none" else {}
+    ordered = {**lj, "proto": proto_job(), "shell": shell_job()}
+    jobs = guard_jobs() + [docs_job()] + [ordered[k] for k in CHECKS[lang] if k != "image"] + [image_job(), gate_job(lang)]
     text = head + "\n".join(jobs)
     assert not re.search(r"[ \t]+$", text, re.M), f"{file}: trailing whitespace"
     # every `inputs.<name>` used must be declared in this file

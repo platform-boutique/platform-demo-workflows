@@ -26,27 +26,50 @@ jobs:
 ```
 
 **`service-ci-<language>`** (pull request): flat, one file per language, so the Actions graph shows only what the repository runs. Left to
-right: `Detect changes`, `Secret scan`, `Workflow lint`; next to them `Lint`, `Build`, `Tests`, `Dependency scan` (SCA),
-`Code scan` (SAST) and `Image build and scan`; at the end one `gate` job:
+right: `Detect changes`, `Secret scan`, `Workflow lint`, `Docs check`; next to them `Lint`, `Proto check`, `Shell check`, `Build`, `Tests`,
+`Integration tests` (only when asked for), `Dependency scan` (SCA), `Code scan` (SAST) and `Image build and scan`; at the end one `gate` job:
 
 ```
-Detect changes --+--> Lint | Build | Tests | Dependency scan | Code scan | Image build and scan --+
-Secret scan -----+                                                                                +--> gate --> merge
-Workflow lint ---+--------------------------------------------------------------------------------+      (approval)
+Detect changes --+--> Lint | Proto check | Shell check | Build | Tests | Integration tests* | Dependency scan | Code scan | Image build and scan --+
+Secret scan -----+                                                                                                                                +--> gate --> merge
+Workflow lint ---+--------------------------------------------------------------------------------------------------------------------------------+      (approval)
+Docs check ------+
+(* Integration tests only with the input integration-command; the other jobs are always there and end green with "nothing to check" when
+ the repository has no proto or shell files)
 ```
 
-**The left column means "starts at t=0", not "must pass first"**: all nine jobs start together, the checks wait only for the change
+**The left column means "starts at t=0", not "must pass first"**: all the jobs start together, the checks wait only for the change
 detection (a docs-only change skips them), so a flaky gitleaks download or one lint complaint does not hide the test, SAST and Trivy
 results. `gate` needs every job, always runs, names the failed or cancelled job first (the skips that follow from it are not noise) and is strict
 about the rest; it works on job ids, never on the names: **`ci / gate` is the only required check**; `merge` is after it and is not part of it. The optional smoke test (Go, Node:
 input `smoke-port`) is a step of `Build`, reusing the build; the optional E2E tests (Go: `e2e-packages`) a step of `Tests`;
-there are no optional jobs that would show up as skipped.
+the one optional job that shows up as skipped is `Integration tests` (v3.8.0, below), and the gate expects exactly that.
 The image job builds the image once per source tree and, for a same-repository run, pushes it as `ghcr.io/<repo>:tree-<hash>` and scans that
 digest (see "Build once per tree" below); a fork's or Dependabot's run cannot push and builds into the local daemon as before.
 The files are generated from the stand-alone workflows by `tools/gen-service-ci.py` (job bodies extracted, not retyped; the image steps
 come from `tools/wfgen.py`, shared with the publish) and `tools/check-consistency.py` fails when they drift. Nothing is nested, so GitHub
 validates only the file's own jobs: the caller grants `contents: read` and `packages: write` (and `checks: write` for dotnet alone), and there
 is no placeholder pin or two-step release.
+
+**Proto check, Shell check, Integration tests, Java lint (v3.8.0).** Rule: with the default inputs no existing repository's pull request
+changes colour. A check that is clean on every app repository today **fails** the run; a check that has findings on existing code is
+**report only** (the step ends green, `::warning::` annotations, the run summary lists the findings) until the caller sets the matching
+`*-enforce` input; the integration job exists only when asked for.
+
+| Job (all `service-ci-*`) | What it does | Default | Inputs |
+|---|---|---|---|
+| `Proto check` | for a repository with `.proto` files (looked for in `proto`, `src/main/proto`, `src/protos`; otherwise the job ends green: "nothing to check"): **buf lint** with an inline config, the MINIMAL rules without `PACKAGE_DIRECTORY_MATCH` (the legacy package `hipstershop` does not match its directory), and **buf breaking** (FILE rules) of the pull request's directory against a checkout of the repository's **default branch** (skipped when the default branch has no proto there yet). buf v1.75.0 is downloaded and its sha256 is verified in the step; a `buf.yaml` in the repository is not used | breaking: **fails** the run (a changed or removed field/RPC; proto changes are additive only); lint: report only | `proto-dir` (empty = look), `proto-lint-enforce` (false), `proto-breaking-enforce` (true) |
+| `Shell check` | shellcheck 0.11.0 (downloaded, sha256 verified) on every tracked `*.sh` file (`-x`, default severity); no script = green "nothing to check" | report only | `shellcheck-enforce` (false) |
+| `Integration tests` (not in `-none`) | TEST-02: the same checkout, toolchain and dependency steps as `Tests`, then your command under `bash -euo pipefail`, from the repository root; Docker is available for throwaway containers (Postgres, Kafka, Redis). **Skipped, and the gate expects exactly that, unless `integration-command` is set**; it is the only job of the file that shows up as skipped | off | `integration-command` (empty) |
+| step in `Lint` of `-java` | `./gradlew compileJava --rerun` with `javac -Xlint:all` added through an init script (no change to the repository's build files); `-Werror` only when enforced | report only | `java-lint-enforce` (false) |
+
+The tool versions (buf, shellcheck) are fixed in `tools/gen-service-ci.py` (no workflow input; Dependabot does not read a download URL in a
+script): bump the version and the sha256 together. `Proto check` and `Shell check` run after `Detect changes` like the other checks (a
+documentation-only change skips them) and are part of `gate`. Findings on the repositories at `origin/main` when this was written:
+buf lint (report only) flags currency-, email-, payment- and recommendation-service (the health proto shares a directory with a service proto,
+rule DIRECTORY_SAME_PACKAGE); shellcheck flags frontend `tests/faro/run.sh` (SC2034, SC2329); javac `-Xlint:all` gives 5 distinct warnings in
+ad-service (deprecation: `HealthStatusManager`, `ProtoReflectionService.newInstance`; `try`; `serial`). Fixing them and then setting the
+`*-enforce` inputs is the follow-up.
 
 **`service-publish`** (merge to `main`, or `merge`/manual `workflow_dispatch`): ONE flat generated workflow
 (`tools/gen-service-publish.py`; the only nested workflow is the unchanged `gitops-promote.yaml@341f641`, shared with the helm repository):
