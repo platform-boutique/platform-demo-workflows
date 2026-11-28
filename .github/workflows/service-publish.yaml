@@ -878,7 +878,7 @@ jobs:
     # the nested workflow: gitops-promote.yaml is shared with the helm repository and unchanged (works with the GitHub App token, not this one).
     # `Promote to stage` and `Promote to prod` call the same pinned file. It serialises itself per app and environment (its own concurrency group).
     permissions: {}
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/gitops-promote.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/gitops-promote.yaml@a277aeb9226f9b2905cbf9d77626f69bd770f486 # v3.7.0
     with:
       app: ${{ inputs.app }}
       env: ${{ inputs.env }}
@@ -1606,7 +1606,7 @@ jobs:
     if: ${{ needs.approve-stage.outputs.go == 'true' }}
     # the same shared workflow as `Open dev PR` (unchanged); the digest is THIS run's, never "the newest"
     permissions: {}
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/gitops-promote.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/gitops-promote.yaml@a277aeb9226f9b2905cbf9d77626f69bd770f486 # v3.7.0
     with:
       app: ${{ inputs.app }}
       env: stage
@@ -1912,7 +1912,7 @@ jobs:
       # Short-lived, limited to ONE repository and ONE permission (the same action and pin as gitops-promote.yaml).
       - name: Create a GitHub App token (platform-demo-helm only)
         id: app-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           app-id: ${{ secrets.PROMOTE_APP_ID }}
           private-key: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
@@ -2328,7 +2328,7 @@ jobs:
     if: ${{ needs.approve-prod.outputs.go == 'true' }}
     # the same shared workflow as `Open dev PR` (unchanged); the digest is THIS run's, never "the newest"
     permissions: {}
-    uses: platform-boutique/platform-demo-workflows/.github/workflows/gitops-promote.yaml@341f641320553ad73969b637ff125466e6b2d99c # v3.1.0
+    uses: platform-boutique/platform-demo-workflows/.github/workflows/gitops-promote.yaml@a277aeb9226f9b2905cbf9d77626f69bd770f486 # v3.7.0
     with:
       app: ${{ inputs.app }}
       env: prod
